@@ -158,6 +158,10 @@ pub fn run(cli: Cli) -> Result<()> {
             if !no_start {
                 for name in &order {
                     let service = &project.services[name];
+                    if service.privileged {
+                        println!("[=] Container {name} started via SDK (privileged)");
+                        continue;
+                    }
                     if backend.container_running(&service.container_name)? {
                         println!("[=] Container {name} is already running");
                     } else {
@@ -431,10 +435,11 @@ fn create_services(
     pull: PullPolicy,
     build_policy: BuildPolicy,
 ) -> Result<()> {
+    let availability = backend.ensure_available()?;
     backend.ensure_project_resources(project)?;
     for name in order {
         let service = &project.services[name];
-        warn_compatibility(service)?;
+        warn_compatibility(service, availability.sdk_version.is_some())?;
         let image = require_image(service)?;
         let built = if let Some(build) = &service.build {
             if should_build(build_policy, build.generated_tag) {
@@ -480,11 +485,11 @@ fn require_image(service: &Service) -> Result<&str> {
     })
 }
 
-fn warn_compatibility(service: &Service) -> Result<()> {
-    if service.privileged {
+fn warn_compatibility(service: &Service, sdk_available: bool) -> Result<()> {
+    if service.privileged && !sdk_available {
         return Err(Error::Unsupported {
             service: service.name.clone(),
-            feature: "privileged (wslc.exe does not expose the SDK privileged flag)".to_owned(),
+            feature: "privileged requires WSLC SDK (wslcsdk.dll not visible)".to_owned(),
         });
     }
     if service.restart.is_some() {

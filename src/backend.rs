@@ -138,6 +138,9 @@ impl WslcBackend {
     }
 
     pub fn create(&self, project: &Project, service: &Service) -> Result<()> {
+        if service.privileged {
+            return sdk_create(project, service);
+        }
         let args = create_args(
             project,
             service,
@@ -156,6 +159,9 @@ impl WslcBackend {
         service: &Service,
         options: OneOffOptions<'_>,
     ) -> Result<()> {
+        if service.privileged {
+            return sdk_create(project, service);
+        }
         let args = create_args(
             project,
             service,
@@ -393,6 +399,9 @@ fn create_args(
     if let Some(cpus) = &service.cpus {
         args.extend(["--cpus".to_owned(), cpus.clone()]);
     }
+    for (_, ulimit) in &service.ulimits {
+        args.extend(["--ulimit".to_owned(), ulimit.clone()]);
+    }
     if let Some(workdir) = &service.working_dir {
         args.extend(["--workdir".to_owned(), workdir.clone()]);
     }
@@ -534,6 +543,117 @@ fn split_registry(image: &str) -> (&str, &str) {
     }
 }
 
+
+
+    /// Creates a privileged container using the SDK backend.
+    /// This path is required because wslc.exe CLI does not expose --privileged.
+    fn sdk_create(_project: &Project, service: &Service) -> Result<()> {
+                
+        use wslc::ProcessOptions;
+
+        let image = service
+            .image
+            .as_deref()
+            .ok_or_else(|| Error::MissingImage {
+                service: service.name.clone(),
+            })?;
+
+        // Create a default WSLC session with an empty storage directory
+        let session_dir = std::env::temp_dir().join(format!("wslc-session-{}", std::process::id()));
+        std::fs::create_dir_all(&session_dir).map_err(|e| Error::InvalidConfig(
+            format!("failed to create session directory: {}", e)
+        ))?;
+        let session = wslc::Session::builder("default", &session_dir)
+            .start()
+            .map_err(|e| Error::InvalidConfig(format!("SDK session creation failed: {}", e)))?;
+
+        // Pull image first
+        let pull_options = wslc::ImagePullOptions::new(image.to_owned());
+        session.pull_image(pull_options)
+            .run()
+            .map_err(|e| Error::InvalidConfig(format!("SDK image pull failed: {}", e)))?;
+
+        let options = wslc::ContainerOptions::new(image.to_owned());
+        let mut builder = session.container(options)
+        .privileged(true)
+        .name(service.container_name.clone());
+
+        if let Some(hostname) = &service.hostname {
+            builder = builder.hostname(hostname.clone());
+        }
+        if let Some(domain_name) = &service.domain_name {
+            builder = builder.domain_name(domain_name.clone());
+        }
+        if service.gpus {
+            builder = builder.enable_gpu(true);
+        }
+
+        // Build init process from entrypoint + command
+        let mut cmdline = service.entrypoint.clone();
+        if cmdline.is_empty() {
+            cmdline = service.command.clone();
+        } else if !service.command.is_empty() {
+            cmdline.extend(service.command.iter().cloned());
+        }
+        if !cmdline.is_empty() {
+            let mut process = ProcessOptions::new(cmdline);
+            if let Some(workdir) = &service.working_dir {
+                process = process.working_dir(workdir.clone());
+            }
+            for (key, value) in &service.environment {
+                process = process.env(key.clone(), value.clone());
+            }
+            builder = builder.init_process(process);
+        }
+
+        // Port mappings
+        for port in &service.ports {
+            // Parse "HOST:CONTAINER" or "HOST:CONTAINER/PROTO"
+            let (host, container) = if let Some(idx) = port.rfind(':') {
+                let host_part = &port[..idx];
+                let container_part = &port[idx + 1..];
+                // Remove protocol suffix if present
+                let container = container_part.split('/').next().unwrap_or(container_part);
+                let host = if host_part == "0.0.0.0" || host_part == "" {
+                    "0"
+                } else {
+                    host_part
+                };
+                (host, container)
+            } else {
+                ("0", port.as_str())
+            };
+            let host_port: u16 = host.parse().unwrap_or(0);
+            let container_port: u16 = container.parse().unwrap_or(0);
+            if container_port > 0 {
+                builder = builder.port(host_port, container_port);
+            }
+        }
+
+        // Volume mounts
+        for mount in &service.mounts {
+            match mount {
+                Mount::Bind { source, target, read_only: _ } => {
+                    builder = builder.volume(source.clone(), target.clone());  // TODO: read_only not supported by SDK
+                }
+                Mount::Volume { source: _, target: _, read_only: _ } => {
+                    // Named volumes need Windows host path resolution
+                    // For now, skip SDK path for named volumes - requires session storage path
+                }
+                _ => {}
+            }
+        }
+
+        let container = builder
+            .create()
+            .map_err(|e| Error::InvalidConfig(format!("SDK container creation failed: {}", e)))?;
+
+        container
+            .start()
+            .map_err(|e| Error::InvalidConfig(format!("SDK container start failed: {}", e)))?;
+
+        Ok(())
+    }
 #[cfg(test)]
 mod tests {
     use indexmap::{IndexMap, IndexSet};
@@ -569,6 +689,7 @@ mod tests {
             gpus: false,
             memory: None,
             cpus: None,
+            ulimits: IndexMap::new(),
             stop_signal: "SIGTERM".to_owned(),
             stop_grace_period: std::time::Duration::from_secs(10),
             restart: None,

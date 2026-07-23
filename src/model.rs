@@ -43,6 +43,7 @@ pub struct Service {
     pub gpus: bool,
     pub memory: Option<String>,
     pub cpus: Option<String>,
+    pub ulimits: IndexMap<String, String>,
     pub stop_signal: String,
     pub stop_grace_period: Duration,
     pub restart: Option<String>,
@@ -192,6 +193,8 @@ pub struct RawService {
     #[serde(default)]
     pub cpus: Option<Value>,
     #[serde(default)]
+    pub ulimits: IndexMap<String, Value>,
+    #[serde(default)]
     pub stop_signal: Option<String>,
     #[serde(default)]
     pub stop_grace_period: Option<String>,
@@ -291,6 +294,34 @@ impl Project {
             volumes,
         })
     }
+}
+
+
+fn normalize_ulimits(
+    raw: &IndexMap<String, Value>,
+) -> Result<IndexMap<String, String>> {
+    let mut result = IndexMap::new();
+    for (name, value) in raw.iter() {
+        let formatted = match value {
+            Value::Number(n) => format!("{}={}", name, n),
+            Value::Mapping(m) => {
+                let soft = m.get(Value::String("soft".to_owned()))
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::InvalidConfig(
+                        format!("ulimit {}: missing or invalid 'soft'", name)
+                    ))?;
+                let hard = m.get(Value::String("hard".to_owned()))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(soft);
+                format!("{}={}:{}", name, soft, hard)
+            }
+            _ => return Err(Error::InvalidConfig(
+                format!("ulimit {}: must be a number or soft/hard map", name)
+            )),
+        };
+        result.insert(name.clone(), formatted);
+    }
+    Ok(result)
 }
 
 fn normalize_service(
@@ -413,6 +444,7 @@ fn normalize_service(
         gpus: raw.gpus.as_ref().is_some_and(|value| !value.is_null()),
         memory: raw.mem_limit.as_ref().and_then(scalar_string),
         cpus: raw.cpus.as_ref().and_then(scalar_string),
+        ulimits: normalize_ulimits(&raw.ulimits)?,
         stop_signal: raw.stop_signal.unwrap_or_else(|| "SIGTERM".to_owned()),
         stop_grace_period: raw
             .stop_grace_period
