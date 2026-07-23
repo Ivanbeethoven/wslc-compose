@@ -1,0 +1,617 @@
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::{Command, ExitStatus, Stdio};
+
+use crate::model::{BuildConfig, Mount, Project, Resource, Service};
+use crate::{Error, Result};
+
+pub struct WslcBackend {
+    program: OsString,
+    working_dir: PathBuf,
+}
+
+pub struct Availability {
+    pub cli_version: String,
+    pub sdk_version: Option<wslc::Version>,
+}
+
+pub struct OneOffOptions<'a> {
+    pub name: &'a str,
+    pub command: &'a [String],
+    pub environment: &'a [String],
+    pub detach: bool,
+    pub remove: bool,
+    pub service_ports: bool,
+}
+
+pub struct ExecOptions<'a> {
+    pub command: &'a [String],
+    pub environment: &'a [String],
+    pub detach: bool,
+    pub interactive: bool,
+    pub tty: bool,
+    pub user: Option<&'a str>,
+    pub workdir: Option<&'a str>,
+}
+
+pub struct LogOptions<'a> {
+    pub follow: bool,
+    pub tail: Option<u64>,
+    pub timestamps: bool,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+}
+
+impl WslcBackend {
+    pub fn new(working_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            program: OsString::from("wslc"),
+            working_dir: working_dir.into(),
+        }
+    }
+
+    pub fn ensure_available(&self) -> Result<Availability> {
+        let cli_version = self.capture(&["version".to_owned()])?.trim().to_owned();
+        let sdk_version = match wslc::Service::ensure_available() {
+            Ok(()) => Some(wslc::Service::version()?),
+            Err(wslc::Error::SdkNotFound(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Availability {
+            cli_version,
+            sdk_version,
+        })
+    }
+
+    pub fn pull(&self, image: &str) -> Result<()> {
+        self.inherit(&["pull".to_owned(), resolve_image_reference(image)?])
+    }
+
+    pub fn build(&self, build: &BuildConfig, no_cache: bool, pull: bool) -> Result<()> {
+        let mut args = vec!["build".to_owned(), "--tag".to_owned(), build.tag.clone()];
+        if no_cache {
+            args.push("--no-cache".to_owned());
+        }
+        if pull {
+            args.push("--pull".to_owned());
+        }
+        if let Some(dockerfile) = &build.dockerfile {
+            args.extend(["--file".to_owned(), dockerfile.display().to_string()]);
+        }
+        if let Some(target) = &build.target {
+            args.extend(["--target".to_owned(), target.clone()]);
+        }
+        for (key, value) in &build.args {
+            args.extend(["--build-arg".to_owned(), format!("{key}={value}")]);
+        }
+        for (key, value) in &build.labels {
+            args.extend(["--label".to_owned(), format!("{key}={value}")]);
+        }
+        args.push(build.context.display().to_string());
+        self.inherit(&args)
+    }
+
+    pub fn ensure_project_resources(&self, project: &Project) -> Result<()> {
+        for resource in project.networks.values() {
+            self.ensure_resource("network", resource, &project.name)?;
+        }
+        for resource in project.volumes.values() {
+            self.ensure_resource("volume", resource, &project.name)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_project_resources(&self, project: &Project, volumes: bool) -> Result<()> {
+        for resource in project.networks.values().rev() {
+            if !resource.external {
+                self.remove_resource("network", &resource.name)?;
+            }
+        }
+        if volumes {
+            for resource in project.volumes.values().rev() {
+                if !resource.external {
+                    self.remove_resource("volume", &resource.name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn container_exists(&self, name: &str) -> Result<bool> {
+        let status = self.status_quiet(&[
+            "inspect".to_owned(),
+            "--type".to_owned(),
+            "container".to_owned(),
+            name.to_owned(),
+        ])?;
+        Ok(status.success())
+    }
+
+    pub fn container_running(&self, name: &str) -> Result<bool> {
+        let output = self.capture(&[
+            "list".to_owned(),
+            "--filter".to_owned(),
+            format!("name={name}"),
+            "--quiet".to_owned(),
+        ])?;
+        Ok(output.lines().any(|line| !line.trim().is_empty()))
+    }
+
+    pub fn create(&self, project: &Project, service: &Service) -> Result<()> {
+        let args = create_args(
+            project,
+            service,
+            &service.container_name,
+            false,
+            true,
+            &[],
+            &[],
+        )?;
+        self.inherit(&args)
+    }
+
+    pub fn run_one_off(
+        &self,
+        project: &Project,
+        service: &Service,
+        options: OneOffOptions<'_>,
+    ) -> Result<()> {
+        let args = create_args(
+            project,
+            service,
+            options.name,
+            options.remove,
+            options.service_ports,
+            options.command,
+            options.environment,
+        )?;
+        let mut run_args = vec!["run".to_owned()];
+        if options.detach {
+            run_args.push("--detach".to_owned());
+        }
+        run_args.extend(args.into_iter().skip(1));
+        self.inherit(&run_args)
+    }
+
+    pub fn start(&self, name: &str) -> Result<()> {
+        self.inherit(&["start".to_owned(), name.to_owned()])
+    }
+
+    pub fn stop(&self, name: &str, signal: &str, timeout: u64) -> Result<()> {
+        self.inherit(&[
+            "stop".to_owned(),
+            "--signal".to_owned(),
+            signal.to_owned(),
+            "--time".to_owned(),
+            timeout.to_string(),
+            name.to_owned(),
+        ])
+    }
+
+    pub fn kill(&self, name: &str, signal: &str) -> Result<()> {
+        self.inherit(&[
+            "kill".to_owned(),
+            "--signal".to_owned(),
+            signal.to_owned(),
+            name.to_owned(),
+        ])
+    }
+
+    pub fn remove(&self, name: &str, force: bool) -> Result<()> {
+        let mut args = vec!["remove".to_owned()];
+        if force {
+            args.push("--force".to_owned());
+        }
+        args.push(name.to_owned());
+        self.inherit(&args)
+    }
+
+    pub fn ps(&self, project: &Project, all: bool, quiet: bool, json: bool) -> Result<()> {
+        let mut args = vec!["list".to_owned()];
+        if all {
+            args.push("--all".to_owned());
+        }
+        args.extend([
+            "--filter".to_owned(),
+            format!("label=com.docker.compose.project={}", project.name),
+        ]);
+        if quiet {
+            args.push("--quiet".to_owned());
+        } else if json {
+            args.extend(["--format".to_owned(), "json".to_owned()]);
+        }
+        self.inherit(&args)
+    }
+
+    pub fn logs(&self, name: &str, options: &LogOptions<'_>) -> Result<()> {
+        let mut args = vec!["logs".to_owned()];
+        if options.follow {
+            args.push("--follow".to_owned());
+        }
+        if let Some(tail) = options.tail {
+            args.extend(["--tail".to_owned(), tail.to_string()]);
+        }
+        if options.timestamps {
+            args.push("--timestamps".to_owned());
+        }
+        if let Some(since) = options.since {
+            args.extend(["--since".to_owned(), since.to_owned()]);
+        }
+        if let Some(until) = options.until {
+            args.extend(["--until".to_owned(), until.to_owned()]);
+        }
+        args.push(name.to_owned());
+        self.inherit(&args)
+    }
+
+    pub fn exec(&self, name: &str, options: ExecOptions<'_>) -> Result<()> {
+        let mut args = vec!["exec".to_owned()];
+        if options.detach {
+            args.push("--detach".to_owned());
+        }
+        if options.interactive {
+            args.push("--interactive".to_owned());
+        }
+        if options.tty {
+            args.push("--tty".to_owned());
+        }
+        for value in options.environment {
+            args.extend(["--env".to_owned(), value.clone()]);
+        }
+        if let Some(user) = options.user {
+            args.extend(["--user".to_owned(), user.to_owned()]);
+        }
+        if let Some(workdir) = options.workdir {
+            args.extend(["--workdir".to_owned(), workdir.to_owned()]);
+        }
+        args.push(name.to_owned());
+        args.extend(options.command.iter().cloned());
+        self.inherit(&args)
+    }
+
+    fn ensure_resource(&self, kind: &str, resource: &Resource, project: &str) -> Result<()> {
+        let existing = self.capture(&[kind.to_owned(), "list".to_owned(), "--quiet".to_owned()])?;
+        if existing.lines().any(|line| line.trim() == resource.name) {
+            return Ok(());
+        }
+        if resource.external {
+            return Err(Error::InvalidConfig(format!(
+                "external {kind} does not exist: {}",
+                resource.name
+            )));
+        }
+
+        let mut args = vec![kind.to_owned(), "create".to_owned()];
+        if let Some(driver) = &resource.driver {
+            args.extend(["--driver".to_owned(), driver.clone()]);
+        }
+        args.extend([
+            "--label".to_owned(),
+            format!("com.docker.compose.project={project}"),
+            "--label".to_owned(),
+            format!("com.docker.compose.{kind}={}", resource.key),
+        ]);
+        for (key, value) in &resource.labels {
+            args.extend(["--label".to_owned(), format!("{key}={value}")]);
+        }
+        args.push(resource.name.clone());
+        self.inherit(&args)
+    }
+
+    fn remove_resource(&self, kind: &str, name: &str) -> Result<()> {
+        let existing = self.capture(&[kind.to_owned(), "list".to_owned(), "--quiet".to_owned()])?;
+        if !existing.lines().any(|line| line.trim() == name) {
+            return Ok(());
+        }
+        self.inherit(&[
+            kind.to_owned(),
+            "remove".to_owned(),
+            "--force".to_owned(),
+            name.to_owned(),
+        ])
+    }
+
+    fn capture(&self, args: &[String]) -> Result<String> {
+        let output = Command::new(&self.program)
+            .args(args)
+            .current_dir(&self.working_dir)
+            .output()
+            .map_err(Error::StartWslc)?;
+        if !output.status.success() {
+            return Err(command_error(args, output.status, &output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn status_quiet(&self, args: &[String]) -> Result<ExitStatus> {
+        Command::new(&self.program)
+            .args(args)
+            .current_dir(&self.working_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(Error::StartWslc)
+    }
+
+    fn inherit(&self, args: &[String]) -> Result<()> {
+        let status = Command::new(&self.program)
+            .args(args)
+            .current_dir(&self.working_dir)
+            .status()
+            .map_err(Error::StartWslc)?;
+        if !status.success() {
+            return Err(Error::WslcCommand {
+                command: args.join(" "),
+                code: status.code().unwrap_or(-1),
+                message: "see wslc output above".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn command_error(args: &[String], status: ExitStatus, stderr: &[u8]) -> Error {
+    Error::WslcCommand {
+        command: args.join(" "),
+        code: status.code().unwrap_or(-1),
+        message: String::from_utf8_lossy(stderr).trim().to_owned(),
+    }
+}
+
+fn create_args(
+    project: &Project,
+    service: &Service,
+    name: &str,
+    auto_remove: bool,
+    include_ports: bool,
+    command_override: &[String],
+    extra_environment: &[String],
+) -> Result<Vec<String>> {
+    let image = service
+        .image
+        .as_deref()
+        .ok_or_else(|| Error::MissingImage {
+            service: service.name.clone(),
+        })?;
+    let mut args = vec!["create".to_owned(), "--name".to_owned(), name.to_owned()];
+
+    if auto_remove {
+        args.push("--rm".to_owned());
+    }
+    if let Some(hostname) = &service.hostname {
+        args.extend(["--hostname".to_owned(), hostname.clone()]);
+    }
+    if let Some(domain_name) = &service.domain_name {
+        args.extend(["--domainname".to_owned(), domain_name.clone()]);
+    }
+    if service.gpus {
+        args.extend(["--gpus".to_owned(), "all".to_owned()]);
+    }
+    if let Some(memory) = &service.memory {
+        args.extend(["--memory".to_owned(), memory.clone()]);
+    }
+    if let Some(cpus) = &service.cpus {
+        args.extend(["--cpus".to_owned(), cpus.clone()]);
+    }
+    if let Some(workdir) = &service.working_dir {
+        args.extend(["--workdir".to_owned(), workdir.clone()]);
+    }
+    if let Some(user) = &service.user {
+        args.extend(["--user".to_owned(), user.clone()]);
+    }
+    if service.tty {
+        args.push("--tty".to_owned());
+    }
+    if service.stdin_open {
+        args.push("--interactive".to_owned());
+    }
+    args.extend(["--stop-signal".to_owned(), service.stop_signal.clone()]);
+
+    for (key, value) in &service.environment {
+        args.extend(["--env".to_owned(), format!("{key}={value}")]);
+    }
+    for value in extra_environment {
+        args.extend(["--env".to_owned(), value.clone()]);
+    }
+    if include_ports {
+        for port in &service.ports {
+            args.extend(["--publish".to_owned(), port.clone()]);
+        }
+    }
+    for mount in &service.mounts {
+        match mount {
+            Mount::Tmpfs { .. } => {
+                args.extend(["--tmpfs".to_owned(), mount.as_cli_value()]);
+            }
+            _ => args.extend(["--volume".to_owned(), mount.as_cli_value()]),
+        }
+    }
+    for network in &service.networks {
+        args.extend(["--network".to_owned(), network.name.clone()]);
+        args.extend(["--network-alias".to_owned(), service.name.clone()]);
+        for alias in &network.aliases {
+            args.extend(["--network-alias".to_owned(), alias.clone()]);
+        }
+    }
+
+    let mut labels = service.labels.clone();
+    labels.insert(
+        "com.docker.compose.project".to_owned(),
+        project.name.clone(),
+    );
+    labels.insert(
+        "com.docker.compose.service".to_owned(),
+        service.name.clone(),
+    );
+    labels.insert(
+        "com.docker.compose.oneoff".to_owned(),
+        auto_remove.to_string(),
+    );
+    labels.insert(
+        "com.docker.compose.project.working_dir".to_owned(),
+        project.working_dir.display().to_string(),
+    );
+    labels.insert(
+        "com.docker.compose.project.config_files".to_owned(),
+        project
+            .source_files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    for (key, value) in labels {
+        args.extend(["--label".to_owned(), format!("{key}={value}")]);
+    }
+
+    if let Some(entrypoint) = service.entrypoint.first() {
+        args.extend(["--entrypoint".to_owned(), entrypoint.clone()]);
+    }
+    args.push(if service.build.is_some() {
+        image.to_owned()
+    } else {
+        resolve_image_reference(image)?
+    });
+
+    if service.entrypoint.len() > 1 {
+        args.extend(service.entrypoint.iter().skip(1).cloned());
+    }
+    if command_override.is_empty() {
+        args.extend(service.command.iter().cloned());
+    } else {
+        args.extend(command_override.iter().cloned());
+    }
+    Ok(args)
+}
+
+fn resolve_image_reference(image: &str) -> Result<String> {
+    let (registry, remainder) = split_registry(image);
+    let env_key = if registry == "docker.io" {
+        "WSLC_REGISTRY_MIRROR".to_owned()
+    } else {
+        format!(
+            "WSLC_REGISTRY_MIRROR_{}",
+            registry
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        )
+    };
+    let Ok(mirror) = std::env::var(&env_key) else {
+        return Ok(image.to_owned());
+    };
+    let mirror = mirror.trim().trim_end_matches('/');
+    if mirror.is_empty() || mirror.contains("://") {
+        return Err(Error::InvalidConfig(format!(
+            "{env_key} must contain a registry host, not a URL"
+        )));
+    }
+    Ok(format!("{mirror}/{remainder}"))
+}
+
+fn split_registry(image: &str) -> (&str, &str) {
+    let first = image.split('/').next().unwrap_or(image);
+    if image.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost") {
+        let remainder = image
+            .strip_prefix(first)
+            .unwrap_or(image)
+            .trim_start_matches('/');
+        let registry = if matches!(first, "index.docker.io" | "registry-1.docker.io") {
+            "docker.io"
+        } else {
+            first
+        };
+        (registry, remainder)
+    } else {
+        (
+            "docker.io",
+            image.strip_prefix("docker.io/").unwrap_or(image),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::{IndexMap, IndexSet};
+
+    use super::*;
+    use crate::model::{Service, ServiceNetwork};
+
+    fn project_and_service() -> (Project, Service) {
+        let service = Service {
+            name: "web".to_owned(),
+            image: Some("docker.io/library/alpine:latest".to_owned()),
+            build: None,
+            container_name: "demo-web-1".to_owned(),
+            command: vec!["sleep".to_owned(), "60".to_owned()],
+            entrypoint: Vec::new(),
+            environment: IndexMap::from([("MODE".to_owned(), "test".to_owned())]),
+            ports: vec!["8080:80".to_owned()],
+            mounts: Vec::new(),
+            depends_on: Vec::new(),
+            profiles: IndexSet::new(),
+            labels: IndexMap::new(),
+            networks: vec![ServiceNetwork {
+                name: "demo_default".to_owned(),
+                aliases: Vec::new(),
+            }],
+            hostname: None,
+            domain_name: None,
+            privileged: false,
+            working_dir: None,
+            user: None,
+            tty: false,
+            stdin_open: false,
+            gpus: false,
+            memory: None,
+            cpus: None,
+            stop_signal: "SIGTERM".to_owned(),
+            stop_grace_period: std::time::Duration::from_secs(10),
+            restart: None,
+            unsupported: Vec::new(),
+        };
+        let project = Project {
+            name: "demo".to_owned(),
+            working_dir: PathBuf::from(r"C:\demo"),
+            source_files: vec![PathBuf::from(r"C:\demo\compose.yaml")],
+            services: IndexMap::from([("web".to_owned(), service.clone())]),
+            networks: IndexMap::new(),
+            volumes: IndexMap::new(),
+        };
+        (project, service)
+    }
+
+    #[test]
+    fn create_arguments_include_compose_identity_and_runtime_options() {
+        let (project, service) = project_and_service();
+        let args = create_args(
+            &project,
+            &service,
+            &service.container_name,
+            false,
+            true,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(args[0], "create");
+        assert!(args.windows(2).any(|pair| pair == ["--name", "demo-web-1"]));
+        assert!(args.windows(2).any(|pair| pair == ["--publish", "8080:80"]));
+        assert!(args
+            .iter()
+            .any(|value| value == "com.docker.compose.project=demo"));
+        assert!(args.iter().any(|value| value == "MODE=test"));
+    }
+
+    #[test]
+    fn mirror_configuration_rejects_urls() {
+        std::env::set_var("WSLC_REGISTRY_MIRROR", "https://mirror.example.com");
+        let result = resolve_image_reference("alpine:latest");
+        std::env::remove_var("WSLC_REGISTRY_MIRROR");
+        assert!(result.unwrap_err().to_string().contains("not a URL"));
+    }
+}

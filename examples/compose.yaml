@@ -1,0 +1,19 @@
+name: wslc-compose-demo
+
+services:
+  clock:
+    image: ${WSLC_COMPOSE_IMAGE:-docker.io/library/alpine:latest}
+    command: ["sh", "-c", "while true; do date; sleep 5; done"]
+    environment:
+      DEMO_MODE: ${DEMO_MODE:-clock}
+    volumes:
+      - demo-data:/data
+
+  worker:
+    image: ${WSLC_COMPOSE_IMAGE:-docker.io/library/alpine:latest}
+    command: ["sh", "-c", "while true; do echo working; sleep 10; done"]
+    depends_on:
+      - clock
+
+volumes:
+  demo-data:

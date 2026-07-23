@@ -1,0 +1,9 @@
+name: wslc-build-demo
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sh", "-c", "echo build-demo-ready; sleep 120"]
+
