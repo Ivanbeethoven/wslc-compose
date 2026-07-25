@@ -437,7 +437,7 @@ impl DaemonState {
                 Error::InvalidConfig(format!("failed to create SDK session storage: {error}"))
             })?;
             self.session = Some(
-                wslc::Session::builder("wslc-compose", storage)
+                wslc::Session::builder(&format!("wslc-compose-{}", std::process::id()), storage)
                     .terminate_on_drop(false)
                     .start()
                     .map_err(|error| {
@@ -461,10 +461,12 @@ impl DaemonState {
             })?;
         }
         let session = self.session()?.clone();
-        session
+        if let Err(error) = session
             .pull_image(wslc::ImagePullOptions::new(&service.image))
             .run()
-            .map_err(|error| Error::InvalidConfig(format!("SDK image pull failed: {error}")))?;
+        {
+            eprintln!("SDK daemon: image pull for {} skipped (already cached or unavailable): {error}", service.image);
+        }
 
         self.resolve_service_urls(&project, &mut service.environment);
 
