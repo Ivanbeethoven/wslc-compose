@@ -406,11 +406,7 @@ fn serve(port: u16, token: String, state_root: PathBuf) -> Result<()> {
         let Ok(stream) = stream else {
             continue;
         };
-        let state = state.clone();
-        let token = token.clone();
-        std::thread::spawn(move || {
-            let _ = handle_connection(stream, &token, &mut state.lock().unwrap());
-        });
+        let _ = handle_connection(stream, &token, &mut state.lock().unwrap());
     }
     Ok(())
 }
