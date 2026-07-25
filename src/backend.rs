@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::model::{BuildConfig, Mount, Project, Resource, Service};
+use crate::sdk_daemon::Client as SdkClient;
 use crate::{Error, Result};
 
 pub struct WslcBackend {
     program: OsString,
     working_dir: PathBuf,
+    sdk: SdkClient,
 }
 
 pub struct Availability {
@@ -47,7 +49,12 @@ impl WslcBackend {
         Self {
             program: OsString::from("wslc"),
             working_dir: working_dir.into(),
+            sdk: SdkClient::new(),
         }
+    }
+
+    pub fn uses_sdk_project(&self, project: &Project) -> bool {
+        SdkClient::project_uses_sdk(project)
     }
 
     pub fn ensure_available(&self) -> Result<Availability> {
@@ -92,6 +99,9 @@ impl WslcBackend {
     }
 
     pub fn ensure_project_resources(&self, project: &Project) -> Result<()> {
+        if self.uses_sdk_project(project) {
+            return Ok(());
+        }
         for resource in project.networks.values() {
             self.ensure_resource("network", resource, &project.name)?;
         }
@@ -102,6 +112,9 @@ impl WslcBackend {
     }
 
     pub fn remove_project_resources(&self, project: &Project, volumes: bool) -> Result<()> {
+        if self.uses_sdk_project(project) {
+            return Ok(());
+        }
         for resource in project.networks.values().rev() {
             if !resource.external {
                 self.remove_resource("network", &resource.name)?;
@@ -118,6 +131,9 @@ impl WslcBackend {
     }
 
     pub fn container_exists(&self, name: &str) -> Result<bool> {
+        if self.sdk.existing(name)?.unwrap_or(false) {
+            return Ok(true);
+        }
         let status = self.status_quiet(&[
             "inspect".to_owned(),
             "--type".to_owned(),
@@ -127,7 +143,17 @@ impl WslcBackend {
         Ok(status.success())
     }
 
+    pub fn project_container_exists(&self, project: &Project, name: &str) -> Result<bool> {
+        if self.uses_sdk_project(project) {
+            return Ok(self.sdk.existing(name)?.unwrap_or(false));
+        }
+        self.container_exists(name)
+    }
+
     pub fn container_running(&self, name: &str) -> Result<bool> {
+        if self.sdk.running(name)?.unwrap_or(false) {
+            return Ok(true);
+        }
         let output = self.capture(&[
             "list".to_owned(),
             "--filter".to_owned(),
@@ -137,7 +163,17 @@ impl WslcBackend {
         Ok(output.lines().any(|line| !line.trim().is_empty()))
     }
 
+    pub fn project_container_running(&self, project: &Project, name: &str) -> Result<bool> {
+        if self.uses_sdk_project(project) {
+            return Ok(self.sdk.running(name)?.unwrap_or(false));
+        }
+        self.container_running(name)
+    }
+
     pub fn create(&self, project: &Project, service: &Service) -> Result<()> {
+        if self.uses_sdk_project(project) {
+            return self.sdk.create(project, service);
+        }
         let args = create_args(
             project,
             service,
@@ -174,10 +210,16 @@ impl WslcBackend {
     }
 
     pub fn start(&self, name: &str) -> Result<()> {
+        if self.sdk.start(name)? {
+            return Ok(());
+        }
         self.inherit(&["start".to_owned(), name.to_owned()])
     }
 
     pub fn stop(&self, name: &str, signal: &str, timeout: u64) -> Result<()> {
+        if self.sdk.stop(name, signal, timeout)? {
+            return Ok(());
+        }
         self.inherit(&[
             "stop".to_owned(),
             "--signal".to_owned(),
@@ -189,6 +231,9 @@ impl WslcBackend {
     }
 
     pub fn kill(&self, name: &str, signal: &str) -> Result<()> {
+        if self.sdk.stop(name, signal, 0)? {
+            return Ok(());
+        }
         self.inherit(&[
             "kill".to_owned(),
             "--signal".to_owned(),
@@ -198,6 +243,9 @@ impl WslcBackend {
     }
 
     pub fn remove(&self, name: &str, force: bool) -> Result<()> {
+        if self.sdk.remove(name, force)? {
+            return Ok(());
+        }
         let mut args = vec!["remove".to_owned()];
         if force {
             args.push("--force".to_owned());
@@ -207,44 +255,51 @@ impl WslcBackend {
     }
 
     pub fn ps(&self, project: &Project, all: bool, quiet: bool, json: bool) -> Result<()> {
-        let mut args = vec!["list".to_owned()];
+        if self.uses_sdk_project(project) {
+            let containers = self.sdk.list(&project.name)?.unwrap_or_default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&containers)?);
+            } else if quiet {
+                for c in &containers {
+                    println!("{}", c.name);
+                }
+            } else {
+                for c in &containers {
+                    println!("{:30} {}", c.name, c.state);
+                }
+            }
+            return Ok(());
+        }
+        let mut args = vec!["ps".to_owned()];
         if all {
             args.push("--all".to_owned());
         }
-        args.extend([
-            "--filter".to_owned(),
-            format!("label=com.docker.compose.project={}", project.name),
-        ]);
         if quiet {
             args.push("--quiet".to_owned());
-        } else if json {
-            args.extend(["--format".to_owned(), "json".to_owned()]);
         }
-        self.inherit(&args)
-    }
-
-    pub fn logs(&self, name: &str, options: &LogOptions<'_>) -> Result<()> {
-        let mut args = vec!["logs".to_owned()];
-        if options.follow {
-            args.push("--follow".to_owned());
+        if json {
+            args.push("--format".to_owned());
+            args.push("json".to_owned());
         }
-        if let Some(tail) = options.tail {
-            args.extend(["--tail".to_owned(), tail.to_string()]);
-        }
-        if options.timestamps {
-            args.push("--timestamps".to_owned());
-        }
-        if let Some(since) = options.since {
-            args.extend(["--since".to_owned(), since.to_owned()]);
-        }
-        if let Some(until) = options.until {
-            args.extend(["--until".to_owned(), until.to_owned()]);
-        }
-        args.push(name.to_owned());
         self.inherit(&args)
     }
 
     pub fn exec(&self, name: &str, options: ExecOptions<'_>) -> Result<()> {
+        if let Some(output) =
+            self.sdk
+                .exec(name, options.command, options.environment, options.workdir)?
+        {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            if output.status != 0 {
+                return Err(Error::WslcCommand {
+                    command: options.command.join(" "),
+                    code: output.status,
+                    message: "SDK container process exited unsuccessfully".to_owned(),
+                });
+            }
+            return Ok(());
+        }
         let mut args = vec!["exec".to_owned()];
         if options.detach {
             args.push("--detach".to_owned());
@@ -282,162 +337,162 @@ impl WslcBackend {
         }
 
         let mut args = vec![kind.to_owned(), "create".to_owned()];
-        if let Some(driver) = &resource.driver {
-            args.extend(["--driver".to_owned(), driver.clone()]);
-        }
         args.extend([
             "--label".to_owned(),
             format!("com.docker.compose.project={project}"),
-            "--label".to_owned(),
-            format!("com.docker.compose.{kind}={}", resource.key),
         ]);
-        for (key, value) in &resource.labels {
-            args.extend(["--label".to_owned(), format!("{key}={value}")]);
-        }
         args.push(resource.name.clone());
         self.inherit(&args)
     }
 
     fn remove_resource(&self, kind: &str, name: &str) -> Result<()> {
-        let existing = self.capture(&[kind.to_owned(), "list".to_owned(), "--quiet".to_owned()])?;
-        if !existing.lines().any(|line| line.trim() == name) {
-            return Ok(());
+        self.inherit(&[kind.to_owned(), "remove".to_owned(), name.to_owned()])
+    }
+
+    fn inherit(&self, args: &[String]) -> Result<()> {
+        let mut command = Command::new(&self.program);
+        command.args(args).current_dir(&self.working_dir);
+        let status = command.status().map_err(|error| {
+            Error::Io("wslc".to_owned(), error.kind().to_string())
+        })?;
+        if !status.success() {
+            return Err(Error::WslcCommand {
+                command: args.join(" "),
+                code: status.code().unwrap_or(1),
+                message: "wslc command failed".to_owned(),
+            });
         }
-        self.inherit(&[
-            kind.to_owned(),
-            "remove".to_owned(),
-            "--force".to_owned(),
-            name.to_owned(),
-        ])
+        Ok(())
     }
 
     fn capture(&self, args: &[String]) -> Result<String> {
         let output = Command::new(&self.program)
             .args(args)
             .current_dir(&self.working_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .output()
-            .map_err(Error::StartWslc)?;
+            .map_err(|error| {
+                Error::Io("wslc".to_owned(), error.kind().to_string())
+            })?;
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
         if !output.status.success() {
-            return Err(command_error(args, output.status, &output.stderr));
+            let err = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(Error::WslcCommand {
+                command: args.join(" "),
+                code: output.status.code().unwrap_or(1),
+                message: if err.is_empty() { text.clone() } else { err },
+            });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(text)
     }
 
     fn status_quiet(&self, args: &[String]) -> Result<ExitStatus> {
-        Command::new(&self.program)
+        let status = Command::new(&self.program)
             .args(args)
             .current_dir(&self.working_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(Error::StartWslc)
-    }
-
-    fn inherit(&self, args: &[String]) -> Result<()> {
-        let status = Command::new(&self.program)
-            .args(args)
-            .current_dir(&self.working_dir)
-            .status()
-            .map_err(Error::StartWslc)?;
-        if !status.success() {
-            return Err(Error::WslcCommand {
-                command: args.join(" "),
-                code: status.code().unwrap_or(-1),
-                message: "see wslc output above".to_owned(),
-            });
-        }
-        Ok(())
-    }
-}
-
-fn command_error(args: &[String], status: ExitStatus, stderr: &[u8]) -> Error {
-    Error::WslcCommand {
-        command: args.join(" "),
-        code: status.code().unwrap_or(-1),
-        message: String::from_utf8_lossy(stderr).trim().to_owned(),
+            .map_err(|error| {
+                Error::Io("wslc".to_owned(), error.kind().to_string())
+            })?;
+        Ok(status)
     }
 }
 
 fn create_args(
     project: &Project,
     service: &Service,
-    name: &str,
+    container_name: &str,
     auto_remove: bool,
-    include_ports: bool,
+    service_ports: bool,
     command_override: &[String],
-    extra_environment: &[String],
+    environment_override: &[String],
 ) -> Result<Vec<String>> {
-    let image = service
-        .image
-        .as_deref()
-        .ok_or_else(|| Error::MissingImage {
-            service: service.name.clone(),
-        })?;
-    let mut args = vec!["create".to_owned(), "--name".to_owned(), name.to_owned()];
+    let image = service.image.as_deref().ok_or_else(|| Error::MissingImage {
+        service: service.name.clone(),
+    })?;
+    let mut args = vec!["create".to_owned(), "--name".to_owned(), container_name.to_owned()];
 
     if auto_remove {
         args.push("--rm".to_owned());
     }
-    if let Some(hostname) = &service.hostname {
-        args.extend(["--hostname".to_owned(), hostname.clone()]);
-    }
-    if let Some(domain_name) = &service.domain_name {
-        args.extend(["--domainname".to_owned(), domain_name.clone()]);
-    }
-    if service.gpus {
-        args.extend(["--gpus".to_owned(), "all".to_owned()]);
-    }
-    if let Some(memory) = &service.memory {
-        args.extend(["--memory".to_owned(), memory.clone()]);
-    }
-    if let Some(cpus) = &service.cpus {
-        args.extend(["--cpus".to_owned(), cpus.clone()]);
-    }
-    if let Some(workdir) = &service.working_dir {
-        args.extend(["--workdir".to_owned(), workdir.clone()]);
-    }
-    if let Some(user) = &service.user {
-        args.extend(["--user".to_owned(), user.clone()]);
-    }
-    if service.tty {
-        args.push("--tty".to_owned());
-    }
-    if service.stdin_open {
-        args.push("--interactive".to_owned());
-    }
-    args.extend(["--stop-signal".to_owned(), service.stop_signal.clone()]);
 
-    for (key, value) in &service.environment {
-        args.extend(["--env".to_owned(), format!("{key}={value}")]);
-    }
-    for value in extra_environment {
-        args.extend(["--env".to_owned(), value.clone()]);
-    }
-    if include_ports {
+    if service_ports {
         for port in &service.ports {
             args.extend(["--publish".to_owned(), port.clone()]);
         }
     }
-    for mount in &service.mounts {
-        match mount {
-            Mount::Tmpfs { .. } => {
-                args.extend(["--tmpfs".to_owned(), mount.as_cli_value()]);
-            }
-            _ => args.extend(["--volume".to_owned(), mount.as_cli_value()]),
-        }
+
+    if service.privileged {
+        args.push("--privileged".to_owned());
     }
-    for network in &service.networks {
-        args.extend(["--network".to_owned(), network.name.clone()]);
-        args.extend(["--network-alias".to_owned(), service.name.clone()]);
-        for alias in &network.aliases {
-            args.extend(["--network-alias".to_owned(), alias.clone()]);
+
+    if let Some(hostname) = &service.hostname {
+        args.extend(["--hostname".to_owned(), hostname.clone()]);
+    }
+
+    if let Some(domain) = &service.domain_name {
+        args.extend(["--domainname".to_owned(), domain.clone()]);
+    }
+
+    if let Some(user) = &service.user {
+        args.extend(["--user".to_owned(), user.clone()]);
+    }
+
+    if let Some(workdir) = &service.working_dir {
+        args.extend(["--workdir".to_owned(), workdir.clone()]);
+    }
+
+    for (key, value) in &service.environment {
+        args.extend(["--env".to_owned(), format!("{key}={value}")]);
+    }
+    for value in environment_override {
+        let mut parts = value.splitn(2, '=');
+        if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
+            args.extend(["--env".to_owned(), format!("{key}={val}")]);
         }
     }
 
-    let mut labels = service.labels.clone();
+    for mount in &service.mounts {
+        match mount {
+            Mount::Bind {
+                source,
+                target,
+                read_only,
+            } => {
+                let mut spec = format!("{}:{}", source.display(), target);
+                if *read_only {
+                    spec.push_str(":ro");
+                }
+                args.extend(["--volume".to_owned(), spec]);
+            }
+            Mount::Volume {
+                source,
+                target,
+                read_only,
+            } => {
+                let mut spec = format!("{}:{}", source, target);
+                if *read_only {
+                    spec.push_str(":ro");
+                }
+                args.extend(["--volume".to_owned(), spec]);
+            }
+            Mount::Anonymous { target, .. } | Mount::Tmpfs { target } => {
+                args.extend(["--volume".to_owned(), target.clone()]);
+            }
+        }
+    }
+
+    let mut labels = indexmap::IndexMap::new();
     labels.insert(
         "com.docker.compose.project".to_owned(),
         project.name.clone(),
+    );
+    labels.insert(
+        "com.docker.compose.version".to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
     );
     labels.insert(
         "com.docker.compose.service".to_owned(),
@@ -569,6 +624,7 @@ mod tests {
             gpus: false,
             memory: None,
             cpus: None,
+            ulimits: IndexMap::new(),
             stop_signal: "SIGTERM".to_owned(),
             stop_grace_period: std::time::Duration::from_secs(10),
             restart: None,
