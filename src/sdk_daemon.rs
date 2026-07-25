@@ -94,6 +94,64 @@ struct SdkMount {
     read_only: bool,
 }
 
+impl SdkService {
+    fn from_service(project: &Project, service: &Service, state_root: &Path) -> Result<Self> {
+        let image = service.image.clone().ok_or_else(|| Error::MissingImage {
+            service: service.name.clone(),
+        })?;
+        let mut mounts = Vec::new();
+        for mount in &service.mounts {
+            match mount {
+                Mount::Bind {
+                    source,
+                    target,
+                    read_only,
+                } => mounts.push(SdkMount {
+                    source: source.clone(),
+                    target: target.clone(),
+                    read_only: *read_only,
+                }),
+                Mount::Volume {
+                    source,
+                    target,
+                    read_only,
+                } => mounts.push(SdkMount {
+                    source: state_root.join("volumes").join(&project.name).join(source),
+                    target: target.clone(),
+                    read_only: *read_only,
+                }),
+                Mount::Anonymous { target, .. } | Mount::Tmpfs { target } => {
+                    return Err(Error::Unsupported {
+                        service: service.name.clone(),
+                        feature: format!(
+                            "SDK backend does not yet support mount type for {target}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            service_name: service.name.clone(),
+            image,
+            container_name: service.container_name.clone(),
+            command: service.command.clone(),
+            entrypoint: service.entrypoint.clone(),
+            environment: service
+                .environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            ports: service.ports.clone(),
+            mounts,
+            hostname: service.hostname.clone(),
+            domain_name: service.domain_name.clone(),
+            privileged: service.privileged,
+            working_dir: service.working_dir.clone(),
+            gpus: service.gpus,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ContainerInfo {
     pub(crate) name: String,
@@ -464,6 +522,17 @@ fn handle_command(command: CommandRequest, state: &mut DaemonState) -> Response 
                 builder = builder.entrypoint(&service.entrypoint);
             }
             let container = builder.build().map_err(Error::Wslc)?;
+            let insp = container.inspect().ok();
+            if let (Some(insp), Some(addr)) = (
+                insp.as_ref(),
+                insp.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .as_ref()
+                    .and_then(find_ipv4_address),
+            ) {
+                state
+                    .service_addresses
+                    .insert((project.clone(), service.service_name.clone()), addr);
+            }
             state.containers.insert(cn.clone(), container);
             state.projects.insert(cn.clone(), project.clone());
             serde_json::to_value(true).map_err(Error::Json)
@@ -677,6 +746,29 @@ fn daemon_token() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:032x}{:08x}", nanos, std::process::id())
+}
+
+fn find_ipv4_address(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(key.as_str(), "IPAddress" | "ip_address" | "ipAddress") {
+                    if let Some(address) = value
+                        .as_str()
+                        .filter(|address| address.parse::<std::net::Ipv4Addr>().is_ok())
+                    {
+                        return Some(address.to_owned());
+                    }
+                }
+                if let Some(address) = find_ipv4_address(value) {
+                    return Some(address);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_ipv4_address),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
