@@ -162,7 +162,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         println!("[=] Container {name} started via SDK (privileged)");
                         continue;
                     }
-                    if backend.container_running(&service.container_name)? {
+                    if backend.project_container_running(&project, &service.container_name)? {
                         println!("[=] Container {name} is already running");
                     } else {
                         println!("[+] Starting {name}");
@@ -204,7 +204,7 @@ pub fn run(cli: Cli) -> Result<()> {
             order.reverse();
             for name in order {
                 let service = &project.services[&name];
-                if backend.container_exists(&service.container_name)? {
+                if backend.project_container_exists(&project, &service.container_name)? {
                     println!("[+] Stopping {name}");
                     if let Err(error) =
                         backend.stop(&service.container_name, &service.stop_signal, timeout)
@@ -222,7 +222,7 @@ pub fn run(cli: Cli) -> Result<()> {
             for name in service_order(&project, &services, &profiles, true)? {
                 let service = &project.services[&name];
                 println!("[+] Starting {name}");
-                if !backend.container_running(&service.container_name)? {
+                if !backend.project_container_running(&project, &service.container_name)? {
                     backend.start(&service.container_name)?;
                 }
             }
@@ -342,7 +342,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     service_order(&project, std::slice::from_ref(&service), &profiles, true)?;
                 for dependency in dependencies.into_iter().filter(|name| name != &service) {
                     let dependency = &project.services[&dependency];
-                    if !backend.container_exists(&dependency.container_name)? {
+                    if !backend.project_container_exists(&project, &dependency.container_name)? {
                         backend.create(&project, dependency)?;
                     }
                     if let Err(error) = backend.start(&dependency.container_name) {
@@ -436,12 +436,25 @@ fn create_services(
     build_policy: BuildPolicy,
 ) -> Result<()> {
     let availability = backend.ensure_available()?;
-    backend.ensure_project_resources(project)?;
+    let sdk_project = backend.uses_sdk_project(project);
+    if !sdk_project {
+        backend.ensure_project_resources(project)?;
+    } else {
+        for name in order {
+            validate_sdk_compatibility(&project.services[name])?;
+        }
+    }
     for name in order {
         let service = &project.services[name];
         warn_compatibility(service, availability.sdk_version.is_some())?;
         let image = require_image(service)?;
         let built = if let Some(build) = &service.build {
+            if sdk_project {
+                return Err(Error::Unsupported {
+                    service: service.name.clone(),
+                    feature: "build is not available for SDK-backed Compose projects; publish or pull an image instead".to_owned(),
+                });
+            }
             if should_build(build_policy, build.generated_tag) {
                 println!("[+] Building {name} ({})", build.tag);
                 backend.build(build, false, pull == PullPolicy::Always)?;
@@ -452,12 +465,12 @@ fn create_services(
         } else {
             false
         };
-        if !built && pull != PullPolicy::Never {
+        if !sdk_project && !built && pull != PullPolicy::Never {
             println!("[+] Pulling {name} ({image})");
             backend.pull(image)?;
         }
 
-        let exists = backend.container_exists(&service.container_name)?;
+        let exists = backend.project_container_exists(project, &service.container_name)?;
         if exists && force_recreate {
             println!("[+] Recreating {name}");
             backend.remove(&service.container_name, true)?;
@@ -504,6 +517,27 @@ fn warn_compatibility(service: &Service, sdk_available: bool) -> Result<()> {
             service.name,
             service.unsupported.join(", ")
         );
+    }
+    Ok(())
+}
+
+fn validate_sdk_compatibility(service: &Service) -> Result<()> {
+    if !service.ulimits.is_empty() {
+        return Err(Error::Unsupported {
+            service: service.name.clone(),
+            feature: "ulimits are not exposed by the WSLC SDK backend".to_owned(),
+        });
+    }
+    let unsupported_runtime = ["devices", "cap_add", "security_opt"];
+    if let Some(feature) = service
+        .unsupported
+        .iter()
+        .find(|feature| unsupported_runtime.contains(&feature.as_str()))
+    {
+        return Err(Error::Unsupported {
+            service: service.name.clone(),
+            feature: format!("{feature} is not exposed by the WSLC SDK backend"),
+        });
     }
     Ok(())
 }

@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::model::{BuildConfig, Mount, Project, Resource, Service};
+use crate::sdk_daemon::Client as SdkClient;
 use crate::{Error, Result};
 
 pub struct WslcBackend {
     program: OsString,
     working_dir: PathBuf,
+    sdk: SdkClient,
 }
 
 pub struct Availability {
@@ -47,6 +49,7 @@ impl WslcBackend {
         Self {
             program: OsString::from("wslc"),
             working_dir: working_dir.into(),
+            sdk: SdkClient::new(),
         }
     }
 
@@ -92,6 +95,9 @@ impl WslcBackend {
     }
 
     pub fn ensure_project_resources(&self, project: &Project) -> Result<()> {
+        if self.uses_sdk_project(project) {
+            return Ok(());
+        }
         for resource in project.networks.values() {
             self.ensure_resource("network", resource, &project.name)?;
         }
@@ -102,6 +108,9 @@ impl WslcBackend {
     }
 
     pub fn remove_project_resources(&self, project: &Project, volumes: bool) -> Result<()> {
+        if self.uses_sdk_project(project) {
+            return Ok(());
+        }
         for resource in project.networks.values().rev() {
             if !resource.external {
                 self.remove_resource("network", &resource.name)?;
@@ -118,6 +127,9 @@ impl WslcBackend {
     }
 
     pub fn container_exists(&self, name: &str) -> Result<bool> {
+        if self.sdk.existing(name)?.unwrap_or(false) {
+            return Ok(true);
+        }
         let status = self.status_quiet(&[
             "inspect".to_owned(),
             "--type".to_owned(),
@@ -127,7 +139,17 @@ impl WslcBackend {
         Ok(status.success())
     }
 
+    pub fn project_container_exists(&self, project: &Project, name: &str) -> Result<bool> {
+        if self.uses_sdk_project(project) {
+            return Ok(self.sdk.existing(name)?.unwrap_or(false));
+        }
+        self.container_exists(name)
+    }
+
     pub fn container_running(&self, name: &str) -> Result<bool> {
+        if self.sdk.running(name)?.unwrap_or(false) {
+            return Ok(true);
+        }
         let output = self.capture(&[
             "list".to_owned(),
             "--filter".to_owned(),
@@ -137,9 +159,16 @@ impl WslcBackend {
         Ok(output.lines().any(|line| !line.trim().is_empty()))
     }
 
+    pub fn project_container_running(&self, project: &Project, name: &str) -> Result<bool> {
+        if self.uses_sdk_project(project) {
+            return Ok(self.sdk.running(name)?.unwrap_or(false));
+        }
+        self.container_running(name)
+    }
+
     pub fn create(&self, project: &Project, service: &Service) -> Result<()> {
-        if service.privileged {
-            return sdk_create(project, service);
+        if self.uses_sdk_project(project) {
+            return self.sdk.create(project, service);
         }
         let args = create_args(
             project,
@@ -159,8 +188,11 @@ impl WslcBackend {
         service: &Service,
         options: OneOffOptions<'_>,
     ) -> Result<()> {
-        if service.privileged {
-            return sdk_create(project, service);
+        if self.uses_sdk_project(project) {
+            return Err(Error::Unsupported {
+                service: service.name.clone(),
+                feature: "run is not implemented for SDK-backed Compose projects".to_owned(),
+            });
         }
         let args = create_args(
             project,
@@ -180,10 +212,16 @@ impl WslcBackend {
     }
 
     pub fn start(&self, name: &str) -> Result<()> {
+        if self.sdk.start(name)? {
+            return Ok(());
+        }
         self.inherit(&["start".to_owned(), name.to_owned()])
     }
 
     pub fn stop(&self, name: &str, signal: &str, timeout: u64) -> Result<()> {
+        if self.sdk.stop(name, signal, timeout)? {
+            return Ok(());
+        }
         self.inherit(&[
             "stop".to_owned(),
             "--signal".to_owned(),
@@ -195,6 +233,9 @@ impl WslcBackend {
     }
 
     pub fn kill(&self, name: &str, signal: &str) -> Result<()> {
+        if self.sdk.stop(name, signal, 0)? {
+            return Ok(());
+        }
         self.inherit(&[
             "kill".to_owned(),
             "--signal".to_owned(),
@@ -204,6 +245,9 @@ impl WslcBackend {
     }
 
     pub fn remove(&self, name: &str, force: bool) -> Result<()> {
+        if self.sdk.remove(name, force)? {
+            return Ok(());
+        }
         let mut args = vec!["remove".to_owned()];
         if force {
             args.push("--force".to_owned());
@@ -213,6 +257,22 @@ impl WslcBackend {
     }
 
     pub fn ps(&self, project: &Project, all: bool, quiet: bool, json: bool) -> Result<()> {
+        if self.uses_sdk_project(project) {
+            let containers = self.sdk.list(&project.name)?.unwrap_or_default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&containers)?);
+            } else if quiet {
+                for container in containers {
+                    println!("{}", container.name);
+                }
+            } else {
+                println!("NAME\tSTATE");
+                for container in containers {
+                    println!("{}\t{}", container.name, container.state);
+                }
+            }
+            return Ok(());
+        }
         let mut args = vec!["list".to_owned()];
         if all {
             args.push("--all".to_owned());
@@ -230,6 +290,12 @@ impl WslcBackend {
     }
 
     pub fn logs(&self, name: &str, options: &LogOptions<'_>) -> Result<()> {
+        if self.sdk.existing(name)?.unwrap_or(false) {
+            return Err(Error::Unsupported {
+                service: name.to_owned(),
+                feature: "logs are not exposed by the current WSLC SDK".to_owned(),
+            });
+        }
         let mut args = vec!["logs".to_owned()];
         if options.follow {
             args.push("--follow".to_owned());
@@ -251,6 +317,21 @@ impl WslcBackend {
     }
 
     pub fn exec(&self, name: &str, options: ExecOptions<'_>) -> Result<()> {
+        if let Some(output) =
+            self.sdk
+                .exec(name, options.command, options.environment, options.workdir)?
+        {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            if output.status != 0 {
+                return Err(Error::WslcCommand {
+                    command: options.command.join(" "),
+                    code: output.status,
+                    message: "SDK container process exited unsuccessfully".to_owned(),
+                });
+            }
+            return Ok(());
+        }
         let mut args = vec!["exec".to_owned()];
         if options.detach {
             args.push("--detach".to_owned());
@@ -353,6 +434,9 @@ impl WslcBackend {
             });
         }
         Ok(())
+    }
+    pub fn uses_sdk_project(&self, project: &Project) -> bool {
+        SdkClient::project_uses_sdk(project)
     }
 }
 
@@ -543,117 +627,6 @@ fn split_registry(image: &str) -> (&str, &str) {
     }
 }
 
-
-
-    /// Creates a privileged container using the SDK backend.
-    /// This path is required because wslc.exe CLI does not expose --privileged.
-    fn sdk_create(_project: &Project, service: &Service) -> Result<()> {
-                
-        use wslc::ProcessOptions;
-
-        let image = service
-            .image
-            .as_deref()
-            .ok_or_else(|| Error::MissingImage {
-                service: service.name.clone(),
-            })?;
-
-        // Create a default WSLC session with an empty storage directory
-        let session_dir = std::env::temp_dir().join(format!("wslc-session-{}", std::process::id()));
-        std::fs::create_dir_all(&session_dir).map_err(|e| Error::InvalidConfig(
-            format!("failed to create session directory: {}", e)
-        ))?;
-        let session = wslc::Session::builder("default", &session_dir)
-            .start()
-            .map_err(|e| Error::InvalidConfig(format!("SDK session creation failed: {}", e)))?;
-
-        // Pull image first
-        let pull_options = wslc::ImagePullOptions::new(image.to_owned());
-        session.pull_image(pull_options)
-            .run()
-            .map_err(|e| Error::InvalidConfig(format!("SDK image pull failed: {}", e)))?;
-
-        let options = wslc::ContainerOptions::new(image.to_owned());
-        let mut builder = session.container(options)
-        .privileged(true)
-        .name(service.container_name.clone());
-
-        if let Some(hostname) = &service.hostname {
-            builder = builder.hostname(hostname.clone());
-        }
-        if let Some(domain_name) = &service.domain_name {
-            builder = builder.domain_name(domain_name.clone());
-        }
-        if service.gpus {
-            builder = builder.enable_gpu(true);
-        }
-
-        // Build init process from entrypoint + command
-        let mut cmdline = service.entrypoint.clone();
-        if cmdline.is_empty() {
-            cmdline = service.command.clone();
-        } else if !service.command.is_empty() {
-            cmdline.extend(service.command.iter().cloned());
-        }
-        if !cmdline.is_empty() {
-            let mut process = ProcessOptions::new(cmdline);
-            if let Some(workdir) = &service.working_dir {
-                process = process.working_dir(workdir.clone());
-            }
-            for (key, value) in &service.environment {
-                process = process.env(key.clone(), value.clone());
-            }
-            builder = builder.init_process(process);
-        }
-
-        // Port mappings
-        for port in &service.ports {
-            // Parse "HOST:CONTAINER" or "HOST:CONTAINER/PROTO"
-            let (host, container) = if let Some(idx) = port.rfind(':') {
-                let host_part = &port[..idx];
-                let container_part = &port[idx + 1..];
-                // Remove protocol suffix if present
-                let container = container_part.split('/').next().unwrap_or(container_part);
-                let host = if host_part == "0.0.0.0" || host_part == "" {
-                    "0"
-                } else {
-                    host_part
-                };
-                (host, container)
-            } else {
-                ("0", port.as_str())
-            };
-            let host_port: u16 = host.parse().unwrap_or(0);
-            let container_port: u16 = container.parse().unwrap_or(0);
-            if container_port > 0 {
-                builder = builder.port(host_port, container_port);
-            }
-        }
-
-        // Volume mounts
-        for mount in &service.mounts {
-            match mount {
-                Mount::Bind { source, target, read_only: _ } => {
-                    builder = builder.volume(source.clone(), target.clone());  // TODO: read_only not supported by SDK
-                }
-                Mount::Volume { source: _, target: _, read_only: _ } => {
-                    // Named volumes need Windows host path resolution
-                    // For now, skip SDK path for named volumes - requires session storage path
-                }
-                _ => {}
-            }
-        }
-
-        let container = builder
-            .create()
-            .map_err(|e| Error::InvalidConfig(format!("SDK container creation failed: {}", e)))?;
-
-        container
-            .start()
-            .map_err(|e| Error::InvalidConfig(format!("SDK container start failed: {}", e)))?;
-
-        Ok(())
-    }
 #[cfg(test)]
 mod tests {
     use indexmap::{IndexMap, IndexSet};

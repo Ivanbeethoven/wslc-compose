@@ -296,28 +296,29 @@ impl Project {
     }
 }
 
-
-fn normalize_ulimits(
-    raw: &IndexMap<String, Value>,
-) -> Result<IndexMap<String, String>> {
+fn normalize_ulimits(raw: &IndexMap<String, Value>) -> Result<IndexMap<String, String>> {
     let mut result = IndexMap::new();
     for (name, value) in raw.iter() {
         let formatted = match value {
-            Value::Number(n) => format!("{}={}", name, n),
+            Value::Number(n) => format!("{name}={n}"),
             Value::Mapping(m) => {
-                let soft = m.get(Value::String("soft".to_owned()))
+                let soft = m
+                    .get(Value::String("soft".to_owned()))
                     .and_then(Value::as_i64)
-                    .ok_or_else(|| Error::InvalidConfig(
-                        format!("ulimit {}: missing or invalid 'soft'", name)
-                    ))?;
-                let hard = m.get(Value::String("hard".to_owned()))
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(format!("ulimit {name}: missing or invalid 'soft'"))
+                    })?;
+                let hard = m
+                    .get(Value::String("hard".to_owned()))
                     .and_then(Value::as_i64)
                     .unwrap_or(soft);
-                format!("{}={}:{}", name, soft, hard)
+                format!("{name}={soft}:{hard}")
             }
-            _ => return Err(Error::InvalidConfig(
-                format!("ulimit {}: must be a number or soft/hard map", name)
-            )),
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "ulimit {name}: must be a number or soft/hard map"
+                )))
+            }
         };
         result.insert(name.clone(), formatted);
     }
