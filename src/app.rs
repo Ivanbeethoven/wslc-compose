@@ -158,7 +158,11 @@ pub fn run(cli: Cli) -> Result<()> {
             if !no_start {
                 for name in &order {
                     let service = &project.services[name];
-                    if backend.container_running(&service.container_name)? {
+                    if service.privileged {
+                        println!("[=] Container {name} started via SDK (privileged)");
+                        continue;
+                    }
+                    if backend.project_container_running(&project, &service.container_name)? {
                         println!("[=] Container {name} is already running");
                     } else {
                         println!("[+] Starting {name}");
@@ -171,56 +175,56 @@ pub fn run(cli: Cli) -> Result<()> {
                     let service = &project.services[&order[0]];
                     backend.logs(
                         &service.container_name,
-                        &LogOptions {
+                        LogOptions {
                             follow: true,
-                            tail: None,
+                            tail: Some(0),
                             timestamps: false,
                             since: None,
                             until: None,
                         },
                     )?;
-                } else {
-                    eprintln!(
-                        "warning: multi-service attached log multiplexing is not implemented; services are running detached"
-                    );
                 }
             }
             Ok(())
         }
         Command::Down {
+            remove_orphans,
             volumes,
             timeout,
-            remove_orphans,
         } => {
             let backend = runtime(&project)?;
             if remove_orphans {
                 eprintln!("warning: --remove-orphans is not implemented yet");
             }
-            let mut order = service_order(&project, &[], &profiles, true)?;
+            let mut order = service_order(&project, &[], &profiles, false)?;
             order.reverse();
             for name in order {
                 let service = &project.services[&name];
-                if backend.container_exists(&service.container_name)? {
+                let running = backend.project_container_running(&project, &service.container_name)?;
+                if running {
                     println!("[+] Stopping {name}");
-                    if let Err(error) =
-                        backend.stop(&service.container_name, &service.stop_signal, timeout)
-                    {
-                        eprintln!("warning: {error}");
-                    }
-                    println!("[+] Removing {name}");
-                    backend.remove(&service.container_name, true)?;
+                    backend.stop(
+                        &service.container_name,
+                        &service.stop_signal,
+                        timeout.unwrap_or(service.stop_grace_period.as_secs()),
+                    )?;
                 }
+                println!("[+] Removing {name}");
+                backend.remove(&service.container_name, false)?;
             }
-            backend.remove_project_resources(&project, volumes)
+            backend.remove_project_resources(&project, volumes)?;
+            Ok(())
         }
         Command::Start { services } => {
             let backend = runtime(&project)?;
-            for name in service_order(&project, &services, &profiles, true)? {
+            for name in service_order(&project, &services, &profiles, false)? {
                 let service = &project.services[&name];
-                println!("[+] Starting {name}");
-                if !backend.container_running(&service.container_name)? {
-                    backend.start(&service.container_name)?;
+                if service.privileged {
+                    println!("[=] Container {name} is managed via SDK; start is implicit");
+                    continue;
                 }
+                println!("[+] Starting {name}");
+                backend.start(&service.container_name)?;
             }
             Ok(())
         }
@@ -230,33 +234,49 @@ pub fn run(cli: Cli) -> Result<()> {
             order.reverse();
             for name in order {
                 let service = &project.services[&name];
+                if service.privileged {
+                    println!("[+] Stopping SDK-managed container {name}");
+                    backend.sdk
+                        .stop(
+                            &service.container_name,
+                            &service.stop_signal,
+                            timeout.unwrap_or(service.stop_grace_period.as_secs()),
+                        )?;
+                    continue;
+                }
                 println!("[+] Stopping {name}");
-                backend.stop(&service.container_name, &service.stop_signal, timeout)?;
+                backend.stop(
+                    &service.container_name,
+                    &service.stop_signal,
+                    timeout.unwrap_or(service.stop_grace_period.as_secs()),
+                )?;
             }
             Ok(())
         }
         Command::Restart { services, timeout } => {
             let backend = runtime(&project)?;
-            let order = service_order(&project, &services, &profiles, true)?;
-            for name in order.iter().rev() {
-                let service = &project.services[name];
-                println!("[+] Stopping {name}");
-                backend.stop(&service.container_name, &service.stop_signal, timeout)?;
-            }
-            for name in order {
-                println!("[+] Starting {name}");
-                backend.start(&project.services[&name].container_name)?;
+            for name in service_order(&project, &services, &profiles, false)? {
+                let service = &project.services[&name];
+                if service.privileged {
+                    backend.sdk.stop(
+                        &service.container_name,
+                        &service.stop_signal,
+                        timeout.unwrap_or(service.stop_grace_period.as_secs()),
+                    )?;
+                    backend.sdk.start(&service.container_name)?;
+                    continue;
+                }
+                backend.stop(
+                    &service.container_name,
+                    &service.stop_signal,
+                    timeout.unwrap_or(service.stop_grace_period.as_secs()),
+                )?;
+                backend.start(&service.container_name)?;
             }
             Ok(())
         }
-        Command::Ps {
-            services,
-            all,
-            quiet,
-            format,
-        } => {
+        Command::Ps { all, quiet, format } => {
             let backend = runtime(&project)?;
-            let _ = service_order(&project, &services, &profiles, false)?;
             backend.ps(&project, all, quiet, format == PsFormat::Json)
         }
         Command::Logs {
@@ -268,44 +288,34 @@ pub fn run(cli: Cli) -> Result<()> {
             until,
         } => {
             let backend = runtime(&project)?;
-            let order = service_order(&project, &services, &profiles, false)?;
-            if follow && order.len() > 1 {
-                return Err(Error::InvalidConfig(
-                    "--follow currently supports exactly one service".to_owned(),
-                ));
-            }
-            let options = LogOptions {
-                follow,
-                tail,
-                timestamps,
-                since: since.as_deref(),
-                until: until.as_deref(),
-            };
-            for name in order {
-                if !follow {
-                    println!("==> {name} <==");
-                }
-                backend.logs(&project.services[&name].container_name, &options)?;
+            for name in service_order(&project, &services, &profiles, false)? {
+                backend.logs(
+                    &project.services[&name].container_name,
+                    LogOptions {
+                        follow,
+                        tail,
+                        timestamps,
+                        since: since.as_deref(),
+                        until: until.as_deref(),
+                    },
+                )?;
             }
             Ok(())
         }
         Command::Exec {
+            service,
+            command,
             detach,
             interactive,
             tty,
-            environment,
             user,
             workdir,
-            service,
-            command,
+            environment,
         } => {
             let backend = runtime(&project)?;
-            let service = project
-                .services
-                .get(&service)
-                .ok_or_else(|| Error::UnknownService(service.clone()))?;
+            let container_name = &project.services[&service].container_name;
             backend.exec(
-                &service.container_name,
+                container_name,
                 ExecOptions {
                     command: &command,
                     environment: &environment,
@@ -318,46 +328,32 @@ pub fn run(cli: Cli) -> Result<()> {
             )
         }
         Command::Run {
-            detach,
-            rm,
-            no_deps,
-            environment,
-            name,
-            service_ports,
             service,
             command,
+            detach,
+            entrypoint,
+            environment,
+            name,
+            rm,
+            service_ports,
         } => {
             let backend = runtime(&project)?;
-            let target = project
-                .services
-                .get(&service)
-                .ok_or_else(|| Error::UnknownService(service.clone()))?;
-            backend.ensure_project_resources(&project)?;
-            if !no_deps {
-                let dependencies =
-                    service_order(&project, std::slice::from_ref(&service), &profiles, true)?;
-                for dependency in dependencies.into_iter().filter(|name| name != &service) {
-                    let dependency = &project.services[&dependency];
-                    if !backend.container_exists(&dependency.container_name)? {
-                        backend.create(&project, dependency)?;
-                    }
-                    if let Err(error) = backend.start(&dependency.container_name) {
-                        eprintln!("warning: {error}");
-                    }
-                }
-            }
-            let generated_name = name.unwrap_or_else(|| {
-                let timestamp = SystemTime::now()
+            let service = &project.services[&service];
+            let auto_name = format!(
+                "{}_{}_run_{}",
+                project.name,
+                service.name,
+                SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs();
-                format!("{}-{}-run-{timestamp}", project.name, target.name)
-            });
+                    .as_secs()
+            );
+            let container_name = name.as_deref().unwrap_or(&auto_name);
             backend.run_one_off(
                 &project,
-                target,
+                service,
                 OneOffOptions {
-                    name: &generated_name,
+                    name: container_name,
                     command: &command,
                     environment: &environment,
                     detach,
@@ -431,12 +427,26 @@ fn create_services(
     pull: PullPolicy,
     build_policy: BuildPolicy,
 ) -> Result<()> {
-    backend.ensure_project_resources(project)?;
+    let availability = backend.ensure_available()?;
+    let sdk_project = backend.uses_sdk_project(project);
+    if !sdk_project {
+        backend.ensure_project_resources(project)?;
+    } else {
+        for name in order {
+            validate_sdk_compatibility(&project.services[name])?;
+        }
+    }
     for name in order {
         let service = &project.services[name];
-        warn_compatibility(service)?;
+        warn_compatibility(service, availability.sdk_version.is_some())?;
         let image = require_image(service)?;
         let built = if let Some(build) = &service.build {
+            if sdk_project {
+                return Err(Error::Unsupported {
+                    service: service.name.clone(),
+                    feature: "build is not available for SDK-backed Compose projects; publish or pull an image instead".to_owned(),
+                });
+            }
             if should_build(build_policy, build.generated_tag) {
                 println!("[+] Building {name} ({})", build.tag);
                 backend.build(build, false, pull == PullPolicy::Always)?;
@@ -447,12 +457,12 @@ fn create_services(
         } else {
             false
         };
-        if !built && pull != PullPolicy::Never {
+        if !sdk_project && !built && pull != PullPolicy::Never {
             println!("[+] Pulling {name} ({image})");
             backend.pull(image)?;
         }
 
-        let exists = backend.container_exists(&service.container_name)?;
+        let exists = backend.project_container_exists(project, &service.container_name)?;
         if exists && force_recreate {
             println!("[+] Recreating {name}");
             backend.remove(&service.container_name, true)?;
@@ -480,11 +490,11 @@ fn require_image(service: &Service) -> Result<&str> {
     })
 }
 
-fn warn_compatibility(service: &Service) -> Result<()> {
-    if service.privileged {
+fn warn_compatibility(service: &Service, sdk_available: bool) -> Result<()> {
+    if service.privileged && !sdk_available {
         return Err(Error::Unsupported {
             service: service.name.clone(),
-            feature: "privileged (wslc.exe does not expose the SDK privileged flag)".to_owned(),
+            feature: "privileged requires WSLC SDK (wslcsdk.dll not visible)".to_owned(),
         });
     }
     if service.restart.is_some() {
@@ -499,6 +509,27 @@ fn warn_compatibility(service: &Service) -> Result<()> {
             service.name,
             service.unsupported.join(", ")
         );
+    }
+    Ok(())
+}
+
+fn validate_sdk_compatibility(service: &Service) -> Result<()> {
+    if !service.ulimits.is_empty() {
+        return Err(Error::Unsupported {
+            service: service.name.clone(),
+            feature: "ulimits are not exposed by the WSLC SDK backend".to_owned(),
+        });
+    }
+    let unsupported_runtime = ["devices", "cap_add", "security_opt"];
+    if let Some(feature) = service
+        .unsupported
+        .iter()
+        .find(|feature| unsupported_runtime.contains(&feature.as_str()))
+    {
+        return Err(Error::Unsupported {
+            service: service.name.clone(),
+            feature: format!("{feature} is not exposed by the WSLC SDK backend"),
+        });
     }
     Ok(())
 }
