@@ -487,6 +487,7 @@ impl DaemonState {
         } else {
             cmdline.extend(service.command);
         }
+        cmdline.retain(|arg| !arg.is_empty());
         if !cmdline.is_empty() {
             let mut process = wslc::ProcessOptions::new(cmdline);
             if let Some(workdir) = service.working_dir {
