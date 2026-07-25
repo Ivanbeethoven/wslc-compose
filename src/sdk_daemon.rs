@@ -13,6 +13,8 @@ use crate::model::{Mount, Project, Service};
 use crate::{Error, Result};
 
 const DAEMON_ARGUMENT: &str = "__sdk-daemon";
+const SDK_TIMEOUT_ENV: &str = "WSLC_COMPOSE_SDK_TIMEOUT_SECS";
+const DEFAULT_SDK_TIMEOUT_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DaemonRecord {
@@ -400,13 +402,13 @@ fn serve(port: u16, token: String, state_root: PathBuf) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
         Error::InvalidConfig(format!("failed to start SDK daemon listener: {error}"))
     })?;
-    let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState::new(state_root)));
+    let mut state = DaemonState::new(state_root);
     let token = std::sync::Arc::new(token);
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
-        let _ = handle_connection(stream, &token, &mut state.lock().unwrap());
+        let _ = handle_connection(stream, &token, &mut state);
     }
     Ok(())
 }
@@ -437,7 +439,7 @@ impl DaemonState {
                 Error::InvalidConfig(format!("failed to create SDK session storage: {error}"))
             })?;
             self.session = Some(
-                wslc::Session::builder(&format!("wslc-compose-{}", std::process::id()), storage)
+                wslc::Session::builder(format!("wslc-compose-{}", std::process::id()), storage)
                     .terminate_on_drop(false)
                     .start()
                     .map_err(|error| {
@@ -465,7 +467,10 @@ impl DaemonState {
             .pull_image(wslc::ImagePullOptions::new(&service.image))
             .run()
         {
-            eprintln!("SDK daemon: image pull for {} skipped (already cached or unavailable): {error}", service.image);
+            eprintln!(
+                "SDK daemon: image pull for {} skipped (already cached or unavailable): {error}",
+                service.image
+            );
         }
 
         self.resolve_service_urls(&project, &mut service.environment);
@@ -760,9 +765,11 @@ fn send_request(record: &DaemonRecord, command: CommandRequest) -> Result<Respon
         Duration::from_secs(30),
     )
     .map_err(|error| Error::InvalidConfig(format!("SDK daemon is unavailable: {error}")))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120))).map_err(|error| {
-        Error::InvalidConfig(format!("failed to set SDK daemon read timeout: {error}"))
-    })?;
+    stream
+        .set_read_timeout(sdk_response_timeout())
+        .map_err(|error| {
+            Error::InvalidConfig(format!("failed to set SDK daemon read timeout: {error}"))
+        })?;
     serde_json::to_writer(
         &mut stream,
         &Request {
@@ -780,6 +787,18 @@ fn send_request(record: &DaemonRecord, command: CommandRequest) -> Result<Respon
             Error::InvalidConfig(format!("failed to read SDK daemon response: {error}"))
         })?;
     serde_json::from_str(&response).map_err(Error::Json)
+}
+
+fn sdk_response_timeout() -> Option<Duration> {
+    parse_sdk_response_timeout(std::env::var(SDK_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_sdk_response_timeout(value: Option<&str>) -> Option<Duration> {
+    match value.and_then(|value| value.parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(Duration::from_secs(DEFAULT_SDK_TIMEOUT_SECS)),
+    }
 }
 
 fn command_for_probe(command: &CommandRequest) -> CommandRequest {
@@ -834,5 +853,26 @@ mod tests {
         let mut environment = vec![("REDIS_URL".to_owned(), "redis://redis:6379/0".to_owned())];
         state.resolve_service_urls("demo", &mut environment);
         assert_eq!(environment[0].1, "redis://172.17.0.2:6379/0");
+    }
+
+    #[test]
+    fn sdk_response_timeout_defaults_to_one_hour() {
+        assert_eq!(
+            parse_sdk_response_timeout(None),
+            Some(Duration::from_secs(60 * 60))
+        );
+        assert_eq!(
+            parse_sdk_response_timeout(Some("invalid")),
+            Some(Duration::from_secs(60 * 60))
+        );
+    }
+
+    #[test]
+    fn sdk_response_timeout_accepts_seconds_and_zero_disables_it() {
+        assert_eq!(
+            parse_sdk_response_timeout(Some("900")),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(parse_sdk_response_timeout(Some("0")), None);
     }
 }

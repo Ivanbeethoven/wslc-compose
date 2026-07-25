@@ -109,6 +109,14 @@ $env:WSLC_REGISTRY_MIRROR = "<your-registry>"
 
 No registry endpoint is hard-coded in this repository.
 
+SDK-backed `exec` requests may run for a long time during builds or benchmarks.
+The daemon response timeout defaults to one hour. Override it in seconds, or
+set it to `0` to wait indefinitely:
+
+```powershell
+$env:WSLC_COMPOSE_SDK_TIMEOUT_SECS = "0"
+```
+
 The bundled example also accepts `WSLC_COMPOSE_IMAGE` when you want to validate
 the lifecycle with an image from another public registry.
 
