@@ -41,7 +41,7 @@ deserialized through `compose_spec` before execution.
 | `labels` | Supported | Compose identity labels are added automatically |
 | `stop_signal`, `stop_grace_period` | Supported | Command timeout can override grace period |
 | `restart` | Parsed only | WSLC restart policy is not enforced yet |
-| `privileged` | Experimental | Uses a persistent local SDK daemon because SDK handles cannot be reopened by a later CLI process. It does not provide FUSE devices, capability additions, security options, or ulimits. |
+| `privileged` | Experimental | Uses a persistent local SDK daemon because SDK handles cannot be reopened by a later CLI process. On a WSL runtime with privileged FUSE support, the container receives `/dev/fuse`; explicit `devices`, capability additions, security options, and ulimits remain unsupported. |
 | `healthcheck` | Parsed only | No readiness wait in `depends_on` yet |
 | `secrets`, `configs` | Parsed only | Not mounted by the current backend |
 | `deploy` | Parsed only | Swarm/deployment semantics are out of scope |

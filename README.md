@@ -57,6 +57,8 @@ wslc-compose version
 
 The WSLC SDK setup is documented in the
 [`wslc-rs` installation guide](https://github.com/Ivanbeethoven/wslc-rs/blob/master/docs/sdk-installation.md).
+For end-to-end validation against the privileged WSL development branch, see
+the [Windows WSLC test guide](docs/windows-wslc-testing.md).
 
 ## Install
 
