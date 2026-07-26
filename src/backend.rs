@@ -577,7 +577,7 @@ fn create_args(
     Ok(args)
 }
 
-fn resolve_image_reference(image: &str) -> Result<String> {
+pub(crate) fn resolve_image_reference(image: &str) -> Result<String> {
     let (registry, remainder) = split_registry(image);
     let env_key = if registry == "docker.io" {
         "WSLC_REGISTRY_MIRROR".to_owned()

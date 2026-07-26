@@ -117,6 +117,21 @@ set it to `0` to wait indefinitely:
 $env:WSLC_COMPOSE_SDK_TIMEOUT_SECS = "0"
 ```
 
+SDK session data, including the dynamic session VHD and SDK-managed named
+volumes, defaults to `%LOCALAPPDATA%\wslc-compose`. Put it on a data drive when
+running storage-heavy workloads:
+
+```powershell
+$env:WSLC_COMPOSE_STATE_ROOT = "D:\wslc-compose-state"
+```
+
+The session VHD is dynamic and has a 64 GiB default capacity. It consumes only
+the data actually written to it; override the capacity in bytes when needed:
+
+```powershell
+$env:WSLC_COMPOSE_SESSION_VHD_SIZE_BYTES = "137438953472" # 128 GiB
+```
+
 The bundled example also accepts `WSLC_COMPOSE_IMAGE` when you want to validate
 the lifecycle with an image from another public registry.
 

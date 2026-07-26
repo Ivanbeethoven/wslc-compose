@@ -15,6 +15,9 @@ use crate::{Error, Result};
 const DAEMON_ARGUMENT: &str = "__sdk-daemon";
 const SDK_TIMEOUT_ENV: &str = "WSLC_COMPOSE_SDK_TIMEOUT_SECS";
 const DEFAULT_SDK_TIMEOUT_SECS: u64 = 60 * 60;
+const STATE_ROOT_ENV: &str = "WSLC_COMPOSE_STATE_ROOT";
+const SESSION_VHD_SIZE_ENV: &str = "WSLC_COMPOSE_SESSION_VHD_SIZE_BYTES";
+const DEFAULT_SESSION_VHD_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DaemonRecord {
@@ -306,6 +309,7 @@ impl SdkService {
         let image = service.image.clone().ok_or_else(|| Error::MissingImage {
             service: service.name.clone(),
         })?;
+        let image = crate::backend::resolve_image_reference(&image)?;
         let mut mounts = Vec::new();
         for mount in &service.mounts {
             match mount {
@@ -440,6 +444,7 @@ impl DaemonState {
             })?;
             self.session = Some(
                 wslc::Session::builder(format!("wslc-compose-{}", std::process::id()), storage)
+                    .vhd(wslc::VhdOptions::new("storage", session_vhd_size_bytes()?))
                     .terminate_on_drop(false)
                     .start()
                     .map_err(|error| {
@@ -463,15 +468,10 @@ impl DaemonState {
             })?;
         }
         let session = self.session()?.clone();
-        if let Err(error) = session
+        let pull_error = session
             .pull_image(wslc::ImagePullOptions::new(&service.image))
             .run()
-        {
-            eprintln!(
-                "SDK daemon: image pull for {} skipped (already cached or unavailable): {error}",
-                service.image
-            );
-        }
+            .err();
 
         self.resolve_service_urls(&project, &mut service.environment);
 
@@ -515,7 +515,14 @@ impl DaemonState {
             };
         }
         let container = builder.create().map_err(|error| {
-            Error::InvalidConfig(format!("SDK container creation failed: {error}"))
+            let pull_context = pull_error
+                .as_ref()
+                .map(|pull_error| format!("; image pull also failed: {pull_error}"))
+                .unwrap_or_default();
+            Error::InvalidConfig(format!(
+                "SDK container creation failed for {}: {error}{pull_context}",
+                service.image
+            ))
         })?;
         container.start().map_err(|error| {
             Error::InvalidConfig(format!("SDK container start failed: {error}"))
@@ -809,10 +816,36 @@ fn command_for_probe(command: &CommandRequest) -> CommandRequest {
 }
 
 fn state_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
+    std::env::var_os(STATE_ROOT_ENV)
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("wslc-compose")
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("wslc-compose")
+        })
+}
+
+fn session_vhd_size_bytes() -> Result<u64> {
+    parse_session_vhd_size_bytes(std::env::var(SESSION_VHD_SIZE_ENV).ok().as_deref())
+}
+
+fn parse_session_vhd_size_bytes(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_SESSION_VHD_SIZE_BYTES);
+    };
+    let size_bytes = value.parse::<u64>().map_err(|_| {
+        Error::InvalidConfig(format!(
+            "{SESSION_VHD_SIZE_ENV} must be a positive integer number of bytes"
+        ))
+    })?;
+    if size_bytes == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{SESSION_VHD_SIZE_ENV} must be greater than zero"
+        )));
+    }
+    Ok(size_bytes)
 }
 
 fn daemon_token() -> String {
@@ -874,5 +907,52 @@ mod tests {
             Some(Duration::from_secs(900))
         );
         assert_eq!(parse_sdk_response_timeout(Some("0")), None);
+    }
+
+    #[test]
+    fn session_vhd_size_defaults_to_sixty_four_gib() {
+        assert_eq!(
+            parse_session_vhd_size_bytes(None).unwrap(),
+            64 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn session_vhd_size_accepts_a_positive_byte_count() {
+        assert_eq!(
+            parse_session_vhd_size_bytes(Some("1073741824")).unwrap(),
+            1 << 30
+        );
+    }
+
+    #[test]
+    fn session_vhd_size_rejects_zero_and_non_numeric_values() {
+        assert!(parse_session_vhd_size_bytes(Some("0")).is_err());
+        assert!(parse_session_vhd_size_bytes(Some("64g")).is_err());
+    }
+
+    #[test]
+    fn sdk_service_uses_the_mirror_rewritten_image_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let compose_path = temp.path().join("compose.yaml");
+        fs::write(
+            &compose_path,
+            "services:\n  app:\n    image: registry.example.test/team/app:latest\n    privileged: true\n",
+        )
+        .unwrap();
+        let mirror_env = "WSLC_REGISTRY_MIRROR_REGISTRY_EXAMPLE_TEST";
+        std::env::set_var(mirror_env, "mirror.example.test");
+        let loaded = crate::config::load(crate::config::LoadOptions {
+            files: vec![compose_path],
+            project_name: Some("sdk-image".to_owned()),
+            project_directory: None,
+            env_file: None,
+        })
+        .unwrap();
+
+        let service = loaded.project.services.get("app").unwrap();
+        let sdk_service = SdkService::from_service(&loaded.project, service, temp.path()).unwrap();
+        std::env::remove_var(mirror_env);
+        assert_eq!(sdk_service.image, "mirror.example.test/team/app:latest");
     }
 }
