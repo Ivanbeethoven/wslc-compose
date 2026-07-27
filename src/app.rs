@@ -175,56 +175,56 @@ pub fn run(cli: Cli) -> Result<()> {
                     let service = &project.services[&order[0]];
                     backend.logs(
                         &service.container_name,
-                        LogOptions {
+                        &LogOptions {
                             follow: true,
-                            tail: Some(0),
+                            tail: None,
                             timestamps: false,
                             since: None,
                             until: None,
                         },
                     )?;
+                } else {
+                    eprintln!(
+                        "warning: multi-service attached log multiplexing is not implemented; services are running detached"
+                    );
                 }
             }
             Ok(())
         }
         Command::Down {
-            remove_orphans,
             volumes,
             timeout,
+            remove_orphans,
         } => {
             let backend = runtime(&project)?;
             if remove_orphans {
                 eprintln!("warning: --remove-orphans is not implemented yet");
             }
-            let mut order = service_order(&project, &[], &profiles, false)?;
+            let mut order = service_order(&project, &[], &profiles, true)?;
             order.reverse();
             for name in order {
                 let service = &project.services[&name];
-                let running = backend.project_container_running(&project, &service.container_name)?;
-                if running {
+                if backend.project_container_exists(&project, &service.container_name)? {
                     println!("[+] Stopping {name}");
-                    backend.stop(
-                        &service.container_name,
-                        &service.stop_signal,
-                        timeout.unwrap_or(service.stop_grace_period.as_secs()),
-                    )?;
+                    if let Err(error) =
+                        backend.stop(&service.container_name, &service.stop_signal, timeout)
+                    {
+                        eprintln!("warning: {error}");
+                    }
+                    println!("[+] Removing {name}");
+                    backend.remove(&service.container_name, true)?;
                 }
-                println!("[+] Removing {name}");
-                backend.remove(&service.container_name, false)?;
             }
-            backend.remove_project_resources(&project, volumes)?;
-            Ok(())
+            backend.remove_project_resources(&project, volumes)
         }
         Command::Start { services } => {
             let backend = runtime(&project)?;
-            for name in service_order(&project, &services, &profiles, false)? {
+            for name in service_order(&project, &services, &profiles, true)? {
                 let service = &project.services[&name];
-                if service.privileged {
-                    println!("[=] Container {name} is managed via SDK; start is implicit");
-                    continue;
-                }
                 println!("[+] Starting {name}");
-                backend.start(&service.container_name)?;
+                if !backend.project_container_running(&project, &service.container_name)? {
+                    backend.start(&service.container_name)?;
+                }
             }
             Ok(())
         }
@@ -234,49 +234,33 @@ pub fn run(cli: Cli) -> Result<()> {
             order.reverse();
             for name in order {
                 let service = &project.services[&name];
-                if service.privileged {
-                    println!("[+] Stopping SDK-managed container {name}");
-                    backend.sdk
-                        .stop(
-                            &service.container_name,
-                            &service.stop_signal,
-                            timeout.unwrap_or(service.stop_grace_period.as_secs()),
-                        )?;
-                    continue;
-                }
                 println!("[+] Stopping {name}");
-                backend.stop(
-                    &service.container_name,
-                    &service.stop_signal,
-                    timeout.unwrap_or(service.stop_grace_period.as_secs()),
-                )?;
+                backend.stop(&service.container_name, &service.stop_signal, timeout)?;
             }
             Ok(())
         }
         Command::Restart { services, timeout } => {
             let backend = runtime(&project)?;
-            for name in service_order(&project, &services, &profiles, false)? {
-                let service = &project.services[&name];
-                if service.privileged {
-                    backend.sdk.stop(
-                        &service.container_name,
-                        &service.stop_signal,
-                        timeout.unwrap_or(service.stop_grace_period.as_secs()),
-                    )?;
-                    backend.sdk.start(&service.container_name)?;
-                    continue;
-                }
-                backend.stop(
-                    &service.container_name,
-                    &service.stop_signal,
-                    timeout.unwrap_or(service.stop_grace_period.as_secs()),
-                )?;
-                backend.start(&service.container_name)?;
+            let order = service_order(&project, &services, &profiles, true)?;
+            for name in order.iter().rev() {
+                let service = &project.services[name];
+                println!("[+] Stopping {name}");
+                backend.stop(&service.container_name, &service.stop_signal, timeout)?;
+            }
+            for name in order {
+                println!("[+] Starting {name}");
+                backend.start(&project.services[&name].container_name)?;
             }
             Ok(())
         }
-        Command::Ps { all, quiet, format } => {
+        Command::Ps {
+            services,
+            all,
+            quiet,
+            format,
+        } => {
             let backend = runtime(&project)?;
+            let _ = service_order(&project, &services, &profiles, false)?;
             backend.ps(&project, all, quiet, format == PsFormat::Json)
         }
         Command::Logs {
@@ -288,34 +272,44 @@ pub fn run(cli: Cli) -> Result<()> {
             until,
         } => {
             let backend = runtime(&project)?;
-            for name in service_order(&project, &services, &profiles, false)? {
-                backend.logs(
-                    &project.services[&name].container_name,
-                    LogOptions {
-                        follow,
-                        tail,
-                        timestamps,
-                        since: since.as_deref(),
-                        until: until.as_deref(),
-                    },
-                )?;
+            let order = service_order(&project, &services, &profiles, false)?;
+            if follow && order.len() > 1 {
+                return Err(Error::InvalidConfig(
+                    "--follow currently supports exactly one service".to_owned(),
+                ));
+            }
+            let options = LogOptions {
+                follow,
+                tail,
+                timestamps,
+                since: since.as_deref(),
+                until: until.as_deref(),
+            };
+            for name in order {
+                if !follow {
+                    println!("==> {name} <==");
+                }
+                backend.logs(&project.services[&name].container_name, &options)?;
             }
             Ok(())
         }
         Command::Exec {
-            service,
-            command,
             detach,
             interactive,
             tty,
+            environment,
             user,
             workdir,
-            environment,
+            service,
+            command,
         } => {
             let backend = runtime(&project)?;
-            let container_name = &project.services[&service].container_name;
+            let service = project
+                .services
+                .get(&service)
+                .ok_or_else(|| Error::UnknownService(service.clone()))?;
             backend.exec(
-                container_name,
+                &service.container_name,
                 ExecOptions {
                     command: &command,
                     environment: &environment,
@@ -328,32 +322,46 @@ pub fn run(cli: Cli) -> Result<()> {
             )
         }
         Command::Run {
-            service,
-            command,
             detach,
-            entrypoint,
+            rm,
+            no_deps,
             environment,
             name,
-            rm,
             service_ports,
+            service,
+            command,
         } => {
             let backend = runtime(&project)?;
-            let service = &project.services[&service];
-            let auto_name = format!(
-                "{}_{}_run_{}",
-                project.name,
-                service.name,
-                SystemTime::now()
+            let target = project
+                .services
+                .get(&service)
+                .ok_or_else(|| Error::UnknownService(service.clone()))?;
+            backend.ensure_project_resources(&project)?;
+            if !no_deps {
+                let dependencies =
+                    service_order(&project, std::slice::from_ref(&service), &profiles, true)?;
+                for dependency in dependencies.into_iter().filter(|name| name != &service) {
+                    let dependency = &project.services[&dependency];
+                    if !backend.project_container_exists(&project, &dependency.container_name)? {
+                        backend.create(&project, dependency)?;
+                    }
+                    if let Err(error) = backend.start(&dependency.container_name) {
+                        eprintln!("warning: {error}");
+                    }
+                }
+            }
+            let generated_name = name.unwrap_or_else(|| {
+                let timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs()
-            );
-            let container_name = name.as_deref().unwrap_or(&auto_name);
+                    .as_secs();
+                format!("{}-{}-run-{timestamp}", project.name, target.name)
+            });
             backend.run_one_off(
                 &project,
-                service,
+                target,
                 OneOffOptions {
-                    name: container_name,
+                    name: &generated_name,
                     command: &command,
                     environment: &environment,
                     detach,

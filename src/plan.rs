@@ -143,6 +143,7 @@ mod tests {
             gpus: false,
             memory: None,
             cpus: None,
+            ulimits: IndexMap::new(),
             stop_signal: "SIGTERM".to_owned(),
             stop_grace_period: std::time::Duration::from_secs(10),
             restart: None,

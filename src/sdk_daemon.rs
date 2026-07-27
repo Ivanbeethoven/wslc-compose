@@ -13,6 +13,11 @@ use crate::model::{Mount, Project, Service};
 use crate::{Error, Result};
 
 const DAEMON_ARGUMENT: &str = "__sdk-daemon";
+const SDK_TIMEOUT_ENV: &str = "WSLC_COMPOSE_SDK_TIMEOUT_SECS";
+const DEFAULT_SDK_TIMEOUT_SECS: u64 = 60 * 60;
+const STATE_ROOT_ENV: &str = "WSLC_COMPOSE_STATE_ROOT";
+const SESSION_VHD_SIZE_ENV: &str = "WSLC_COMPOSE_SESSION_VHD_SIZE_BYTES";
+const DEFAULT_SESSION_VHD_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DaemonRecord {
@@ -92,64 +97,6 @@ struct SdkMount {
     source: PathBuf,
     target: String,
     read_only: bool,
-}
-
-impl SdkService {
-    fn from_service(project: &Project, service: &Service, state_root: &Path) -> Result<Self> {
-        let image = service.image.clone().ok_or_else(|| Error::MissingImage {
-            service: service.name.clone(),
-        })?;
-        let mut mounts = Vec::new();
-        for mount in &service.mounts {
-            match mount {
-                Mount::Bind {
-                    source,
-                    target,
-                    read_only,
-                } => mounts.push(SdkMount {
-                    source: source.clone(),
-                    target: target.clone(),
-                    read_only: *read_only,
-                }),
-                Mount::Volume {
-                    source,
-                    target,
-                    read_only,
-                } => mounts.push(SdkMount {
-                    source: state_root.join("volumes").join(&project.name).join(source),
-                    target: target.clone(),
-                    read_only: *read_only,
-                }),
-                Mount::Anonymous { target, .. } | Mount::Tmpfs { target } => {
-                    return Err(Error::Unsupported {
-                        service: service.name.clone(),
-                        feature: format!(
-                            "SDK backend does not yet support mount type for {target}"
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(Self {
-            service_name: service.name.clone(),
-            image,
-            container_name: service.container_name.clone(),
-            command: service.command.clone(),
-            entrypoint: service.entrypoint.clone(),
-            environment: service
-                .environment
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            ports: service.ports.clone(),
-            mounts,
-            hostname: service.hostname.clone(),
-            domain_name: service.domain_name.clone(),
-            privileged: service.privileged,
-            working_dir: service.working_dir.clone(),
-            gpus: service.gpus,
-        })
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -273,33 +220,36 @@ impl Client {
     }
 
     fn call_existing_raw(&self, command: CommandRequest) -> Result<Option<serde_json::Value>> {
-        let Some(mut record) = Self::read_record(&self.root)? else {
+        let Some(record) = self.read_live_record()? else {
             return Ok(None);
         };
         let response = send_request(&record, command)?;
         if !response.ok {
-            Self::delete_record(&self.root)?;
-            return Ok(None);
+            return Err(Error::InvalidConfig(
+                response
+                    .error
+                    .unwrap_or_else(|| "SDK daemon request failed".to_owned()),
+            ));
         }
         Ok(Some(response.payload))
     }
 
-    fn read_record(root: &Path) -> Result<Option<DaemonRecord>> {
-        let path = root.join("sdk-daemon.json");
-        match fs::read_to_string(&path) {
-            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::InvalidConfig(format!(
-                "failed to read SDK daemon record: {error}"
-            ))),
+    fn read_live_record(&self) -> Result<Option<DaemonRecord>> {
+        let path = self.record_path();
+        let Ok(contents) = fs::read(&path) else {
+            return Ok(None);
+        };
+        let Ok(record) = serde_json::from_slice::<DaemonRecord>(&contents) else {
+            let _ = fs::remove_file(path);
+            return Ok(None);
+        };
+        match send_request(&record, CommandRequest::Ping) {
+            Ok(response) if response.ok => Ok(Some(record)),
+            _ => {
+                let _ = fs::remove_file(self.record_path());
+                Ok(None)
+            }
         }
-    }
-
-    fn delete_record(root: &Path) -> Result<()> {
-        let path = root.join("sdk-daemon.json");
-        fs::remove_file(&path).map_err(|error| {
-            Error::InvalidConfig(format!("failed to remove SDK daemon record: {error}"))
-        })
     }
 
     fn start_daemon(&self) -> Result<()> {
@@ -334,17 +284,82 @@ impl Client {
                 Error::InvalidConfig(format!("failed to start SDK daemon: {error}"))
             })?;
 
-        let record_path = self.root.join("sdk-daemon.json");
-        std::thread::sleep(Duration::from_millis(100));
+        let record = DaemonRecord { port, token };
         for _ in 0..30 {
-            if record_path.exists() {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(
+                send_request(&record, CommandRequest::Ping),
+                Ok(Response { ok: true, .. })
+            ) {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
         Err(Error::InvalidConfig(
-            "SDK daemon did not publish its endpoint".to_owned(),
+            "SDK daemon did not become ready within three seconds".to_owned(),
         ))
+    }
+
+    fn record_path(&self) -> PathBuf {
+        self.root.join("sdk-daemon.json")
+    }
+}
+
+impl SdkService {
+    fn from_service(project: &Project, service: &Service, state_root: &Path) -> Result<Self> {
+        let image = service.image.clone().ok_or_else(|| Error::MissingImage {
+            service: service.name.clone(),
+        })?;
+        let image = crate::backend::resolve_image_reference(&image)?;
+        let mut mounts = Vec::new();
+        for mount in &service.mounts {
+            match mount {
+                Mount::Bind {
+                    source,
+                    target,
+                    read_only,
+                } => mounts.push(SdkMount {
+                    source: source.clone(),
+                    target: target.clone(),
+                    read_only: *read_only,
+                }),
+                Mount::Volume {
+                    source,
+                    target,
+                    read_only,
+                } => mounts.push(SdkMount {
+                    source: state_root.join("volumes").join(&project.name).join(source),
+                    target: target.clone(),
+                    read_only: *read_only,
+                }),
+                Mount::Anonymous { target, .. } | Mount::Tmpfs { target } => {
+                    return Err(Error::Unsupported {
+                        service: service.name.clone(),
+                        feature: format!(
+                            "SDK backend does not yet support mount type for {target}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            service_name: service.name.clone(),
+            image,
+            container_name: service.container_name.clone(),
+            command: service.command.clone(),
+            entrypoint: service.entrypoint.clone(),
+            environment: service
+                .environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            ports: service.ports.clone(),
+            mounts,
+            hostname: service.hostname.clone(),
+            domain_name: service.domain_name.clone(),
+            privileged: service.privileged,
+            working_dir: service.working_dir.clone(),
+            gpus: service.gpus,
+        })
     }
 }
 
@@ -391,17 +406,13 @@ fn serve(port: u16, token: String, state_root: PathBuf) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
         Error::InvalidConfig(format!("failed to start SDK daemon listener: {error}"))
     })?;
-    let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState::new(state_root)));
+    let mut state = DaemonState::new(state_root);
     let token = std::sync::Arc::new(token);
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
-        let state = state.clone();
-        let token = token.clone();
-        std::thread::spawn(move || {
-            let _ = handle_connection(stream, &token, &mut state.lock().unwrap());
-        });
+        let _ = handle_connection(stream, &token, &mut state);
     }
     Ok(())
 }
@@ -428,170 +439,243 @@ impl DaemonState {
     fn session(&mut self) -> Result<&wslc::Session> {
         if self.session.is_none() {
             let storage = self.root.join("session");
-            fs::create_dir_all(&storage).ok();
+            fs::create_dir_all(&storage).map_err(|error| {
+                Error::InvalidConfig(format!("failed to create SDK session storage: {error}"))
+            })?;
             self.session = Some(
-                wslc::Session::builder("wslc-compose", storage)
+                wslc::Session::builder(format!("wslc-compose-{}", std::process::id()), storage)
+                    .vhd(wslc::VhdOptions::new("storage", session_vhd_size_bytes()?))
                     .terminate_on_drop(false)
                     .start()
-                    .map_err(Error::Wslc)?,
+                    .map_err(|error| {
+                        Error::InvalidConfig(format!("SDK session creation failed: {error}"))
+                    })?,
             );
         }
-        Ok(self.session.as_ref().unwrap())
+        Ok(self.session.as_ref().expect("session initialized"))
     }
 
-    fn resolve_service_urls(&self, project: &str, environment: &mut Vec<(String, String)>) {
-        for (key, value) in environment.iter_mut() {
-            for ((proj, svc), addr) in &self.service_addresses {
-                if proj != project {
+    fn create(&mut self, project: String, mut service: SdkService) -> Result<()> {
+        if self.containers.contains_key(&service.container_name) {
+            return Ok(());
+        }
+        for mount in &service.mounts {
+            fs::create_dir_all(&mount.source).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "failed to create SDK mount source {}: {error}",
+                    mount.source.display()
+                ))
+            })?;
+        }
+        let session = self.session()?.clone();
+        let pull_error = session
+            .pull_image(wslc::ImagePullOptions::new(&service.image))
+            .run()
+            .err();
+
+        self.resolve_service_urls(&project, &mut service.environment);
+
+        let mut builder = session
+            .container(wslc::ContainerOptions::new(&service.image))
+            .name(&service.container_name)
+            .privileged(service.privileged)
+            .enable_gpu(service.gpus);
+        if let Some(hostname) = service.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Some(domain_name) = service.domain_name {
+            builder = builder.domain_name(domain_name);
+        }
+        let mut cmdline = service.entrypoint;
+        if cmdline.is_empty() {
+            cmdline = service.command;
+        } else {
+            cmdline.extend(service.command);
+        }
+        cmdline.retain(|arg| !arg.is_empty());
+        if !cmdline.is_empty() {
+            let mut process = wslc::ProcessOptions::new(cmdline);
+            if let Some(workdir) = service.working_dir {
+                process = process.working_dir(workdir);
+            }
+            for (key, value) in service.environment {
+                process = process.env(key, value);
+            }
+            builder = builder.init_process(process);
+        }
+        for port in &service.ports {
+            let (host, container) = parse_port(port)?;
+            builder = builder.port(host, container);
+        }
+        for mount in service.mounts {
+            builder = if mount.read_only {
+                builder.volume_read_only(mount.source, mount.target)
+            } else {
+                builder.volume(mount.source, mount.target)
+            };
+        }
+        let container = builder.create().map_err(|error| {
+            let pull_context = pull_error
+                .as_ref()
+                .map(|pull_error| format!("; image pull also failed: {pull_error}"))
+                .unwrap_or_default();
+            Error::InvalidConfig(format!(
+                "SDK container creation failed for {}: {error}{pull_context}",
+                service.image
+            ))
+        })?;
+        container.start().map_err(|error| {
+            Error::InvalidConfig(format!("SDK container start failed: {error}"))
+        })?;
+        let address = container_address(&container)?;
+        self.projects
+            .insert(service.container_name.clone(), project.clone());
+        self.service_addresses
+            .insert((project, service.service_name), address);
+        self.containers.insert(service.container_name, container);
+        Ok(())
+    }
+
+    fn resolve_service_urls(&self, project: &str, environment: &mut [(String, String)]) {
+        for (key, value) in environment {
+            for ((address_project, service), address) in &self.service_addresses {
+                if address_project != project {
                     continue;
                 }
-                let from = format!("{svc}:");
-                *value = value.replace(&from, &format!("{addr}:"));
+                let scheme_host = format!("://{service}");
+                if value.contains(&scheme_host) {
+                    *value = value.replace(&scheme_host, &format!("://{address}"));
+                    eprintln!("SDK network: resolved {service} for {key}");
+                }
             }
         }
     }
 }
 
-fn handle_connection(
-    stream: TcpStream,
-    token: &str,
-    state: &mut DaemonState,
-) -> Result<()> {
-    let mut reader = BufReader::new(&stream);
-    let mut request = String::new();
-    reader.read_line(&mut request).map_err(|error| {
-        Error::InvalidConfig(format!("failed to read SDK daemon request: {error}"))
-    })?;
-    let request: Request = serde_json::from_str(&request)?;
-    if request.token != token {
-        let response = Response {
+fn container_address(container: &wslc::Container) -> Result<String> {
+    let inspect = container.inspect().map_err(Error::Wslc)?;
+    let value: serde_json::Value = serde_json::from_str(&inspect)?;
+    find_ipv4_address(&value).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "SDK container inspect did not include an IPv4 address: {inspect}"
+        ))
+    })
+}
+
+fn find_ipv4_address(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(key.as_str(), "IPAddress" | "ip_address" | "ipAddress") {
+                    if let Some(address) = value
+                        .as_str()
+                        .filter(|address| address.parse::<std::net::Ipv4Addr>().is_ok())
+                    {
+                        return Some(address.to_owned());
+                    }
+                }
+                if let Some(address) = find_ipv4_address(value) {
+                    return Some(address);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_ipv4_address),
+        _ => None,
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, token: &str, state: &mut DaemonState) -> Result<()> {
+    let request = {
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|error| {
+            Error::InvalidConfig(format!("failed to read SDK daemon request: {error}"))
+        })?;
+        serde_json::from_str::<Request>(&line)?
+    };
+    let response = if request.token != token {
+        Response {
             ok: false,
             payload: serde_json::Value::Null,
-            error: Some("token mismatch".to_owned()),
-        };
-        let mut stream = &stream;
-        serde_json::to_writer(&mut stream, &response)?;
-        stream.write_all(b"\n").ok();
-        return Ok(());
-    }
-    let response = handle_command(request.command, state);
-    let mut stream = &stream;
+            error: Some("SDK daemon authentication failed".to_owned()),
+        }
+    } else {
+        match dispatch(request.command, state) {
+            Ok(payload) => Response {
+                ok: true,
+                payload,
+                error: None,
+            },
+            Err(error) => Response {
+                ok: false,
+                payload: serde_json::Value::Null,
+                error: Some(error.to_string()),
+            },
+        }
+    };
     serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n").ok();
+    stream.write_all(b"\n").map_err(|error| {
+        Error::InvalidConfig(format!("failed to write SDK daemon response: {error}"))
+    })?;
     Ok(())
 }
 
-fn handle_command(command: CommandRequest, state: &mut DaemonState) -> Response {
-    let result: Result<serde_json::Value> = match command {
+fn dispatch(command: CommandRequest, state: &mut DaemonState) -> Result<serde_json::Value> {
+    match command {
         CommandRequest::Ping => Ok(serde_json::Value::Bool(true)),
         CommandRequest::Create { project, service } => {
-            let cn = service.container_name.clone();
-            let session = state.session()?.clone();
-            let mut builder = session.container(wslc::ContainerOptions::new(&service.image));
-            builder = builder.name(&cn);
-            if let Some(hostname) = &service.hostname {
-                builder = builder.hostname(hostname);
-            }
-            if let Some(domain) = &service.domain_name {
-                builder = builder.domain_name(domain);
-            }
-            if service.privileged {
-                builder = builder.privileged(true);
-            }
-            if service.gpus {
-                builder = builder.enable_gpu(true);
-            }
-            for (key, value) in &service.environment {
-                builder = builder.env(key, value);
-            }
-            for port in &service.ports {
-                if let Ok((host, container)) = parse_port(port) {
-                    builder = builder.port(host, container);
-                }
-            }
-            for mount in &service.mounts {
-                builder = builder.volume(&mount.source, &mount.target, mount.read_only);
-            }
-            if let Some(wd) = &service.working_dir {
-                builder = builder.working_dir(wd);
-            }
-            if !service.command.is_empty() {
-                builder = builder.command(&service.command);
-            }
-            if !service.entrypoint.is_empty() {
-                builder = builder.entrypoint(&service.entrypoint);
-            }
-            let container = builder.build().map_err(Error::Wslc)?;
-            let insp = container.inspect().ok();
-            if let (Some(insp), Some(addr)) = (
-                insp.as_ref(),
-                insp.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .as_ref()
-                    .and_then(find_ipv4_address),
-            ) {
-                state
-                    .service_addresses
-                    .insert((project.clone(), service.service_name.clone()), addr);
-            }
-            state.containers.insert(cn.clone(), container);
-            state.projects.insert(cn.clone(), project.clone());
-            serde_json::to_value(true).map_err(Error::Json)
+            state.create(project, service)?;
+            Ok(serde_json::Value::Bool(true))
         }
-        CommandRequest::Exists { name } => {
-            serde_json::to_value(state.containers.contains_key(&name)).map_err(Error::Json)
-        }
+        CommandRequest::Exists { name } => Ok(serde_json::Value::Bool(
+            state.containers.contains_key(&name),
+        )),
         CommandRequest::Running { name } => {
-            let Some(container) = state.containers.get(&name) else {
-                return Response {
-                    ok: true,
-                    payload: serde_json::Value::Bool(false),
-                    error: None,
-                };
-            };
-            let state_val = container.state().map_err(Error::Wslc)?;
-            serde_json::to_value(matches!(state_val, wslc::ContainerState::Running))
-                .map_err(Error::Json)
+            let running = state
+                .containers
+                .get(&name)
+                .map(|container| {
+                    container
+                        .state()
+                        .map(|state| state == wslc::ContainerState::Running)
+                })
+                .transpose()
+                .map_err(Error::Wslc)?
+                .unwrap_or(false);
+            Ok(serde_json::Value::Bool(running))
         }
         CommandRequest::Start { name } => {
             let Some(container) = state.containers.get(&name) else {
-                return Response {
-                    ok: false,
-                    payload: serde_json::Value::Null,
-                    error: Some(format!("SDK container not found: {name}")),
-                };
+                return Ok(serde_json::Value::Bool(false));
             };
-            container.start().map_err(Error::Wslc)?;
-            serde_json::to_value(true).map_err(Error::Json)
+            if container.state().map_err(Error::Wslc)? != wslc::ContainerState::Running {
+                container.start().map_err(Error::Wslc)?;
+            }
+            Ok(serde_json::Value::Bool(true))
         }
-        CommandRequest::Stop { name, signal, timeout } => {
+        CommandRequest::Stop {
+            name,
+            signal,
+            timeout,
+        } => {
             let Some(container) = state.containers.get(&name) else {
-                return Response {
-                    ok: false,
-                    payload: serde_json::Value::Null,
-                    error: Some(format!("SDK container not found: {name}")),
-                };
+                return Ok(serde_json::Value::Bool(false));
             };
             container
                 .stop(parse_signal(&signal), Duration::from_secs(timeout))
                 .map_err(Error::Wslc)?;
-            serde_json::to_value(true).map_err(Error::Json)
+            Ok(serde_json::Value::Bool(true))
         }
         CommandRequest::Remove { name, force } => {
-            let Some(container) = state.containers.swap_remove(&name) else {
-                return Response {
-                    ok: false,
-                    payload: serde_json::Value::Null,
-                    error: Some(format!("SDK container not found: {name}")),
-                };
+            let Some(container) = state.containers.shift_remove(&name) else {
+                return Ok(serde_json::Value::Bool(false));
             };
             state.projects.remove(&name);
-            if force {
-                let _ = container.stop(wslc::Signal::Sigkill, Duration::from_secs(0));
-            }
             container
                 .delete(wslc::DeleteContainerOptions::default().force(force))
                 .map_err(Error::Wslc)?;
-            serde_json::to_value(true).map_err(Error::Json)
+            Ok(serde_json::Value::Bool(true))
         }
         CommandRequest::Exec {
             name,
@@ -600,11 +684,9 @@ fn handle_command(command: CommandRequest, state: &mut DaemonState) -> Response 
             workdir,
         } => {
             let Some(container) = state.containers.get(&name) else {
-                return Response {
-                    ok: false,
-                    payload: serde_json::Value::Null,
-                    error: Some(format!("SDK container not found: {name}")),
-                };
+                return Err(Error::InvalidConfig(format!(
+                    "SDK container not found: {name}"
+                )));
             };
             let mut process = wslc::ProcessOptions::new(command).capture_stdout();
             if let Some(workdir) = workdir {
@@ -612,11 +694,9 @@ fn handle_command(command: CommandRequest, state: &mut DaemonState) -> Response 
             }
             for value in environment {
                 let Some((key, value)) = value.split_once('=') else {
-                    return Response {
-                        ok: false,
-                        payload: serde_json::Value::Null,
-                        error: Some(format!("invalid exec environment value: {value}")),
-                    };
+                    return Err(Error::InvalidConfig(format!(
+                        "invalid exec environment value: {value}"
+                    )));
                 };
                 process = process.env(key, value);
             }
@@ -648,18 +728,6 @@ fn handle_command(command: CommandRequest, state: &mut DaemonState) -> Response 
             }
             serde_json::to_value(containers).map_err(Error::Json)
         }
-    };
-    match result {
-        Ok(payload) => Response {
-            ok: true,
-            payload,
-            error: None,
-        },
-        Err(error) => Response {
-            ok: false,
-            payload: serde_json::Value::Null,
-            error: Some(error.to_string()),
-        },
     }
 }
 
@@ -704,9 +772,11 @@ fn send_request(record: &DaemonRecord, command: CommandRequest) -> Result<Respon
         Duration::from_secs(30),
     )
     .map_err(|error| Error::InvalidConfig(format!("SDK daemon is unavailable: {error}")))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120))).map_err(|error| {
-        Error::InvalidConfig(format!("failed to set SDK daemon read timeout: {error}"))
-    })?;
+    stream
+        .set_read_timeout(sdk_response_timeout())
+        .map_err(|error| {
+            Error::InvalidConfig(format!("failed to set SDK daemon read timeout: {error}"))
+        })?;
     serde_json::to_writer(
         &mut stream,
         &Request {
@@ -726,6 +796,18 @@ fn send_request(record: &DaemonRecord, command: CommandRequest) -> Result<Respon
     serde_json::from_str(&response).map_err(Error::Json)
 }
 
+fn sdk_response_timeout() -> Option<Duration> {
+    parse_sdk_response_timeout(std::env::var(SDK_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_sdk_response_timeout(value: Option<&str>) -> Option<Duration> {
+    match value.and_then(|value| value.parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(Duration::from_secs(DEFAULT_SDK_TIMEOUT_SECS)),
+    }
+}
+
 fn command_for_probe(command: &CommandRequest) -> CommandRequest {
     match command {
         CommandRequest::Create { .. } => CommandRequest::Ping,
@@ -734,10 +816,36 @@ fn command_for_probe(command: &CommandRequest) -> CommandRequest {
 }
 
 fn state_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
+    std::env::var_os(STATE_ROOT_ENV)
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("wslc-compose")
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("wslc-compose")
+        })
+}
+
+fn session_vhd_size_bytes() -> Result<u64> {
+    parse_session_vhd_size_bytes(std::env::var(SESSION_VHD_SIZE_ENV).ok().as_deref())
+}
+
+fn parse_session_vhd_size_bytes(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_SESSION_VHD_SIZE_BYTES);
+    };
+    let size_bytes = value.parse::<u64>().map_err(|_| {
+        Error::InvalidConfig(format!(
+            "{SESSION_VHD_SIZE_ENV} must be a positive integer number of bytes"
+        ))
+    })?;
+    if size_bytes == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{SESSION_VHD_SIZE_ENV} must be greater than zero"
+        )));
+    }
+    Ok(size_bytes)
 }
 
 fn daemon_token() -> String {
@@ -746,29 +854,6 @@ fn daemon_token() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:032x}{:08x}", nanos, std::process::id())
-}
-
-fn find_ipv4_address(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(fields) => {
-            for (key, value) in fields {
-                if matches!(key.as_str(), "IPAddress" | "ip_address" | "ipAddress") {
-                    if let Some(address) = value
-                        .as_str()
-                        .filter(|address| address.parse::<std::net::Ipv4Addr>().is_ok())
-                    {
-                        return Some(address.to_owned());
-                    }
-                }
-                if let Some(address) = find_ipv4_address(value) {
-                    return Some(address);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(values) => values.iter().find_map(find_ipv4_address),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -801,5 +886,73 @@ mod tests {
         let mut environment = vec![("REDIS_URL".to_owned(), "redis://redis:6379/0".to_owned())];
         state.resolve_service_urls("demo", &mut environment);
         assert_eq!(environment[0].1, "redis://172.17.0.2:6379/0");
+    }
+
+    #[test]
+    fn sdk_response_timeout_defaults_to_one_hour() {
+        assert_eq!(
+            parse_sdk_response_timeout(None),
+            Some(Duration::from_secs(60 * 60))
+        );
+        assert_eq!(
+            parse_sdk_response_timeout(Some("invalid")),
+            Some(Duration::from_secs(60 * 60))
+        );
+    }
+
+    #[test]
+    fn sdk_response_timeout_accepts_seconds_and_zero_disables_it() {
+        assert_eq!(
+            parse_sdk_response_timeout(Some("900")),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(parse_sdk_response_timeout(Some("0")), None);
+    }
+
+    #[test]
+    fn session_vhd_size_defaults_to_sixty_four_gib() {
+        assert_eq!(
+            parse_session_vhd_size_bytes(None).unwrap(),
+            64 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn session_vhd_size_accepts_a_positive_byte_count() {
+        assert_eq!(
+            parse_session_vhd_size_bytes(Some("1073741824")).unwrap(),
+            1 << 30
+        );
+    }
+
+    #[test]
+    fn session_vhd_size_rejects_zero_and_non_numeric_values() {
+        assert!(parse_session_vhd_size_bytes(Some("0")).is_err());
+        assert!(parse_session_vhd_size_bytes(Some("64g")).is_err());
+    }
+
+    #[test]
+    fn sdk_service_uses_the_mirror_rewritten_image_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let compose_path = temp.path().join("compose.yaml");
+        fs::write(
+            &compose_path,
+            "services:\n  app:\n    image: registry.example.test/team/app:latest\n    privileged: true\n",
+        )
+        .unwrap();
+        let mirror_env = "WSLC_REGISTRY_MIRROR_REGISTRY_EXAMPLE_TEST";
+        std::env::set_var(mirror_env, "mirror.example.test");
+        let loaded = crate::config::load(crate::config::LoadOptions {
+            files: vec![compose_path],
+            project_name: Some("sdk-image".to_owned()),
+            project_directory: None,
+            env_file: None,
+        })
+        .unwrap();
+
+        let service = loaded.project.services.get("app").unwrap();
+        let sdk_service = SdkService::from_service(&loaded.project, service, temp.path()).unwrap();
+        std::env::remove_var(mirror_env);
+        assert_eq!(sdk_service.image, "mirror.example.test/team/app:latest");
     }
 }

@@ -41,15 +41,16 @@ deserialized through `compose_spec` before execution.
 | `labels` | Supported | Compose identity labels are added automatically |
 | `stop_signal`, `stop_grace_period` | Supported | Command timeout can override grace period |
 | `restart` | Parsed only | WSLC restart policy is not enforced yet |
-| `privileged` | Explicit error | SDK supports it, current `wslc.exe` CLI does not |
+| `privileged` | Experimental | Uses a persistent local SDK daemon because SDK handles cannot be reopened by a later CLI process. On a WSL runtime with privileged FUSE support, the container receives `/dev/fuse`; explicit `devices`, capability additions, security options, and ulimits remain unsupported. |
 | `healthcheck` | Parsed only | No readiness wait in `depends_on` yet |
 | `secrets`, `configs` | Parsed only | Not mounted by the current backend |
 | `deploy` | Parsed only | Swarm/deployment semantics are out of scope |
 | `extends`, `include` | Validation only | Full cross-file materialization is pending |
 
 Fields that pass Compose validation but are not applied are reported as
-warnings before a container is created. Platform-incompatible fields such as
-`privileged` fail explicitly rather than silently changing semantics.
+warnings before a container is created. SDK projects that request unsupported
+runtime isolation fields (`devices`, `cap_add`, `security_opt`, or `ulimits`)
+fail before any containers are created rather than silently changing semantics.
 
 ## Known Differences
 
@@ -63,4 +64,3 @@ warnings before a container is created. Platform-incompatible fields such as
    Compose tags such as `!reset` and unique-resource sequence replacement are
    planned.
 5. `--remove-orphans` is accepted but currently reports a warning.
-

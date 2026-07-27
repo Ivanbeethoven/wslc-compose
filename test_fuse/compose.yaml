@@ -1,0 +1,17 @@
+services:
+  fuse-test:
+    image: debian:trixie-slim
+    privileged: true
+    command: |
+      bash -c '
+        apt-get update -qq && apt-get install -y -qq fuse3 2>&1 | tail -1;
+        echo "---CAPS---";
+        cat /proc/1/status | grep -i cap;
+        echo "---FUSE---";
+        ls -la /dev/fuse 2>&1;
+        echo "---MODULES---";
+        grep fuse /proc/filesystems 2>&1;
+        echo "---DD_TEST---";
+        dd if=/dev/fuse of=/dev/null bs=1 count=1 2>&1;
+        echo "FUSE_TEST_EXIT=\True"
+      '

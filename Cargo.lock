@@ -699,8 +699,6 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "wslc"
 version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a98c1f6f9d5c554e2af52c300d0cbea2de2f7211f6ffdb8a5e96346288c0f9ce"
 dependencies = [
  "wslc-sys",
 ]
@@ -725,8 +723,6 @@ dependencies = [
 [[package]]
 name = "wslc-sys"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ef7abb662dfaa3198e7263924e0b4a7616b900ea13b47617835bf2894433c56"
 
 [[package]]
 name = "yoke"

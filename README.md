@@ -57,6 +57,8 @@ wslc-compose version
 
 The WSLC SDK setup is documented in the
 [`wslc-rs` installation guide](https://github.com/Ivanbeethoven/wslc-rs/blob/master/docs/sdk-installation.md).
+For end-to-end validation against the privileged WSL development branch, see
+the [Windows WSLC test guide](docs/windows-wslc-testing.md).
 
 ## Install
 
@@ -108,6 +110,29 @@ $env:WSLC_REGISTRY_MIRROR = "<your-registry>"
 ```
 
 No registry endpoint is hard-coded in this repository.
+
+SDK-backed `exec` requests may run for a long time during builds or benchmarks.
+The daemon response timeout defaults to one hour. Override it in seconds, or
+set it to `0` to wait indefinitely:
+
+```powershell
+$env:WSLC_COMPOSE_SDK_TIMEOUT_SECS = "0"
+```
+
+SDK session data, including the dynamic session VHD and SDK-managed named
+volumes, defaults to `%LOCALAPPDATA%\wslc-compose`. Put it on a data drive when
+running storage-heavy workloads:
+
+```powershell
+$env:WSLC_COMPOSE_STATE_ROOT = "D:\wslc-compose-state"
+```
+
+The session VHD is dynamic and has a 64 GiB default capacity. It consumes only
+the data actually written to it; override the capacity in bytes when needed:
+
+```powershell
+$env:WSLC_COMPOSE_SESSION_VHD_SIZE_BYTES = "137438953472" # 128 GiB
+```
 
 The bundled example also accepts `WSLC_COMPOSE_IMAGE` when you want to validate
 the lifecycle with an image from another public registry.
