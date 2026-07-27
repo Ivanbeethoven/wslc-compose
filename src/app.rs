@@ -172,23 +172,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
             if !detach && !no_start {
-                if order.len() == 1 {
-                    let service = &project.services[&order[0]];
-                    backend.logs(
-                        &service.container_name,
-                        &LogOptions {
-                            follow: true,
-                            tail: None,
-                            timestamps: false,
-                            since: None,
-                            until: None,
-                        },
-                    )?;
-                } else {
-                    eprintln!(
-                        "warning: multi-service attached log multiplexing is not implemented; services are running detached"
-                    );
-                }
+                let services = log_targets(&project, &order);
+                backend.logs_many(
+                    &services,
+                    &LogOptions {
+                        follow: true,
+                        tail: None,
+                        timestamps: false,
+                        since: None,
+                        until: None,
+                    },
+                )?;
             }
             Ok(())
         }
@@ -292,11 +286,6 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let backend = runtime(&project)?;
             let order = service_order(&project, &services, &profiles, false)?;
-            if follow && order.len() > 1 {
-                return Err(Error::InvalidConfig(
-                    "--follow currently supports exactly one service".to_owned(),
-                ));
-            }
             let options = LogOptions {
                 follow,
                 tail,
@@ -304,11 +293,26 @@ pub fn run(cli: Cli) -> Result<()> {
                 since: since.as_deref(),
                 until: until.as_deref(),
             };
+            backend.logs_many(&log_targets(&project, &order), &options)
+        }
+        Command::Stats {
+            services,
+            all,
+            no_trunc,
+            format,
+        } => {
+            let backend = runtime(&project)?;
+            let order = service_order(&project, &services, &profiles, false)?;
             for name in order {
-                if !follow {
+                if format == PsFormat::Table {
                     println!("==> {name} <==");
                 }
-                backend.logs(&project.services[&name].container_name, &options)?;
+                backend.stats(
+                    &project.services[&name].container_name,
+                    all,
+                    no_trunc,
+                    format == PsFormat::Json,
+                )?;
             }
             Ok(())
         }
@@ -497,12 +501,29 @@ fn create_services(
         }
 
         let exists = backend.project_container_exists(project, &service.container_name)?;
-        if exists && force_recreate {
-            println!("[+] Recreating {name}");
-            backend.remove(&service.container_name, true)?;
-        } else if exists && (no_recreate || !force_recreate) {
-            println!("[=] Container {name} already exists");
-            continue;
+        if exists {
+            if no_recreate {
+                println!("[=] Container {name} already exists (--no-recreate)");
+                continue;
+            }
+            let configuration_changed = !sdk_project
+                && !backend.container_matches_configuration(&service.container_name, service)?;
+            if force_recreate || built || should_pull || configuration_changed {
+                let reason = if force_recreate {
+                    "forced"
+                } else if built {
+                    "image rebuilt"
+                } else if should_pull {
+                    "image pulled"
+                } else {
+                    "configuration changed"
+                };
+                println!("[+] Recreating {name} ({reason})");
+                backend.remove(&service.container_name, true)?;
+            } else {
+                println!("[=] Container {name} is up to date");
+                continue;
+            }
         }
         println!("[+] Creating {name}");
         backend.create(project, service)?;
@@ -515,6 +536,13 @@ fn remove_orphans_for_project(backend: &WslcBackend, project: &Project) -> Resul
         println!("[-] Removed orphan container {name}");
     }
     Ok(())
+}
+
+fn log_targets(project: &Project, order: &[String]) -> Vec<(String, String)> {
+    order
+        .iter()
+        .map(|name| (name.clone(), project.services[name].container_name.clone()))
+        .collect()
 }
 
 fn wait_for_service_dependencies(

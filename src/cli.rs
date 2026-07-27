@@ -156,6 +156,17 @@ pub enum Command {
         until: Option<String>,
     },
 
+    /// Display a resource usage snapshot for service containers.
+    Stats {
+        services: Vec<String>,
+        #[arg(short, long)]
+        all: bool,
+        #[arg(long)]
+        no_trunc: bool,
+        #[arg(long, value_enum, default_value_t = PsFormat::Table)]
+        format: PsFormat,
+    },
+
     /// Execute a command in a running service container.
     Exec {
         #[arg(short, long)]
