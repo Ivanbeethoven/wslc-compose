@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::backend::{ExecOptions, LogOptions, OneOffOptions, WslcBackend};
 use crate::cli::{Command, OutputFormat, PsFormat, PullPolicy};
 use crate::config::{self, LoadOptions};
-use crate::model::{Project, Service};
+use crate::model::{DependencyCondition, Project, Service};
 use crate::plan::service_order;
 use crate::{Cli, Error, Result};
 
@@ -58,7 +58,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Pull {
             services,
             ignore_pull_failures,
-            quiet: _,
+            quiet,
         } => {
             let backend = runtime(&project)?;
             for name in service_order(&project, &services, &profiles, true)? {
@@ -73,7 +73,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
                 let image = require_image(service)?;
                 println!("[+] Pulling {name} ({image})");
-                if let Err(error) = backend.pull(image) {
+                if let Err(error) = backend.pull(image, quiet) {
                     if ignore_pull_failures {
                         eprintln!("warning: {error}");
                     } else {
@@ -87,14 +87,14 @@ pub fn run(cli: Cli) -> Result<()> {
             services,
             no_cache,
             pull,
-            quiet: _,
+            quiet,
         } => {
             let backend = runtime(&project)?;
             for name in service_order(&project, &services, &profiles, true)? {
                 let service = &project.services[&name];
                 if let Some(build) = &service.build {
                     println!("[+] Building {name} ({})", build.tag);
-                    backend.build(build, no_cache, pull)?;
+                    backend.build(build, no_cache, pull, quiet)?;
                 } else if !services.is_empty() {
                     eprintln!("warning: service {name} has no build configuration");
                 }
@@ -137,9 +137,6 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let backend = runtime(&project)?;
             let order = service_order(&project, &services, &profiles, true)?;
-            if remove_orphans {
-                eprintln!("warning: --remove-orphans is not implemented yet");
-            }
             create_services(
                 &backend,
                 &project,
@@ -155,9 +152,13 @@ pub fn run(cli: Cli) -> Result<()> {
                     BuildPolicy::Implicit
                 },
             )?;
+            if remove_orphans {
+                remove_orphans_for_project(&backend, &project)?;
+            }
             if !no_start {
                 for name in &order {
                     let service = &project.services[name];
+                    wait_for_service_dependencies(&backend, &project, service)?;
                     if service.privileged {
                         println!("[=] Container {name} started via SDK (privileged)");
                         continue;
@@ -197,9 +198,6 @@ pub fn run(cli: Cli) -> Result<()> {
             remove_orphans,
         } => {
             let backend = runtime(&project)?;
-            if remove_orphans {
-                eprintln!("warning: --remove-orphans is not implemented yet");
-            }
             let mut order = service_order(&project, &[], &profiles, true)?;
             order.reverse();
             for name in order {
@@ -215,12 +213,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     backend.remove(&service.container_name, true)?;
                 }
             }
+            if remove_orphans {
+                remove_orphans_for_project(&backend, &project)?;
+            }
             backend.remove_project_resources(&project, volumes)
         }
         Command::Start { services } => {
             let backend = runtime(&project)?;
             for name in service_order(&project, &services, &profiles, true)? {
                 let service = &project.services[&name];
+                wait_for_service_dependencies(&backend, &project, service)?;
                 println!("[+] Starting {name}");
                 if !backend.project_container_running(&project, &service.container_name)? {
                     backend.start(&service.container_name)?;
@@ -249,7 +251,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             for name in order {
                 println!("[+] Starting {name}");
-                backend.start(&project.services[&name].container_name)?;
+                let service = &project.services[&name];
+                wait_for_service_dependencies(&backend, &project, service)?;
+                backend.start(&service.container_name)?;
             }
             Ok(())
         }
@@ -260,8 +264,23 @@ pub fn run(cli: Cli) -> Result<()> {
             format,
         } => {
             let backend = runtime(&project)?;
-            let _ = service_order(&project, &services, &profiles, false)?;
-            backend.ps(&project, all, quiet, format == PsFormat::Json)
+            let explicit_selection = !services.is_empty();
+            let order = service_order(&project, &services, &profiles, false)?;
+            let container_names = if explicit_selection {
+                order
+                    .iter()
+                    .map(|name| project.services[name].container_name.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            backend.ps(
+                &project,
+                all,
+                quiet,
+                format == PsFormat::Json,
+                &container_names,
+            )
         }
         Command::Logs {
             services,
@@ -345,11 +364,12 @@ pub fn run(cli: Cli) -> Result<()> {
                     if !backend.project_container_exists(&project, &dependency.container_name)? {
                         backend.create(&project, dependency)?;
                     }
-                    if let Err(error) = backend.start(&dependency.container_name) {
-                        eprintln!("warning: {error}");
+                    if !backend.project_container_running(&project, &dependency.container_name)? {
+                        backend.start(&dependency.container_name)?;
                     }
                 }
             }
+            wait_for_service_dependencies(&backend, &project, target)?;
             let generated_name = name.unwrap_or_else(|| {
                 let timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -457,7 +477,7 @@ fn create_services(
             }
             if should_build(build_policy, build.generated_tag) {
                 println!("[+] Building {name} ({})", build.tag);
-                backend.build(build, false, pull == PullPolicy::Always)?;
+                backend.build(build, false, pull == PullPolicy::Always, false)?;
                 true
             } else {
                 false
@@ -465,9 +485,15 @@ fn create_services(
         } else {
             false
         };
-        if !sdk_project && !built && pull != PullPolicy::Never {
+        let should_pull = if sdk_project || built {
+            false
+        } else {
+            let image_exists = pull == PullPolicy::Missing && backend.image_exists(image)?;
+            pull_required(pull, image_exists)
+        };
+        if should_pull {
             println!("[+] Pulling {name} ({image})");
-            backend.pull(image)?;
+            backend.pull(image, false)?;
         }
 
         let exists = backend.project_container_exists(project, &service.container_name)?;
@@ -484,11 +510,46 @@ fn create_services(
     Ok(())
 }
 
+fn remove_orphans_for_project(backend: &WslcBackend, project: &Project) -> Result<()> {
+    for name in backend.remove_orphans(project)? {
+        println!("[-] Removed orphan container {name}");
+    }
+    Ok(())
+}
+
+fn wait_for_service_dependencies(
+    backend: &WslcBackend,
+    project: &Project,
+    service: &Service,
+) -> Result<()> {
+    for dependency_name in &service.depends_on {
+        let condition = service
+            .dependency_conditions
+            .get(dependency_name)
+            .copied()
+            .unwrap_or_default();
+        if condition != DependencyCondition::Started {
+            println!("[=] Waiting for {dependency_name} ({condition:?})");
+            let dependency = &project.services[dependency_name];
+            backend.wait_for_dependency(&dependency.container_name, condition)?;
+        }
+    }
+    Ok(())
+}
+
 fn should_build(policy: BuildPolicy, generated_tag: bool) -> bool {
     match policy {
         BuildPolicy::Force => true,
         BuildPolicy::Implicit => generated_tag,
         BuildPolicy::Never => false,
+    }
+}
+
+fn pull_required(policy: PullPolicy, image_exists: bool) -> bool {
+    match policy {
+        PullPolicy::Always => true,
+        PullPolicy::Missing => !image_exists,
+        PullPolicy::Never => false,
     }
 }
 
@@ -522,6 +583,12 @@ fn warn_compatibility(service: &Service, sdk_available: bool) -> Result<()> {
 }
 
 fn validate_sdk_compatibility(service: &Service) -> Result<()> {
+    if service.healthcheck.is_some() {
+        return Err(Error::Unsupported {
+            service: service.name.clone(),
+            feature: "healthcheck is not exposed by the WSLC SDK backend".to_owned(),
+        });
+    }
     if !service.ulimits.is_empty() {
         return Err(Error::Unsupported {
             service: service.name.clone(),
@@ -564,7 +631,7 @@ fn version(short: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_build, BuildPolicy};
+    use super::{pull_required, should_build, BuildPolicy, PullPolicy};
 
     #[test]
     fn no_build_disables_forced_and_implicit_builds() {
@@ -573,5 +640,13 @@ mod tests {
         assert!(should_build(BuildPolicy::Force, false));
         assert!(should_build(BuildPolicy::Implicit, true));
         assert!(!should_build(BuildPolicy::Implicit, false));
+    }
+
+    #[test]
+    fn missing_pull_policy_only_pulls_absent_images() {
+        assert!(pull_required(PullPolicy::Always, true));
+        assert!(pull_required(PullPolicy::Missing, false));
+        assert!(!pull_required(PullPolicy::Missing, true));
+        assert!(!pull_required(PullPolicy::Never, false));
     }
 }

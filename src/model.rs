@@ -30,6 +30,7 @@ pub struct Service {
     pub ports: Vec<String>,
     pub mounts: Vec<Mount>,
     pub depends_on: Vec<String>,
+    pub dependency_conditions: IndexMap<String, DependencyCondition>,
     pub profiles: IndexSet<String>,
     pub labels: IndexMap<String, String>,
     pub networks: Vec<ServiceNetwork>,
@@ -44,6 +45,7 @@ pub struct Service {
     pub memory: Option<String>,
     pub cpus: Option<String>,
     pub ulimits: IndexMap<String, String>,
+    pub healthcheck: Option<Healthcheck>,
     pub stop_signal: String,
     pub stop_grace_period: Duration,
     pub restart: Option<String>,
@@ -59,6 +61,24 @@ pub struct BuildConfig {
     pub labels: IndexMap<String, String>,
     pub tag: String,
     pub generated_tag: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Healthcheck {
+    pub command: Option<String>,
+    pub interval: Option<String>,
+    pub timeout: Option<String>,
+    pub start_period: Option<String>,
+    pub retries: Option<u32>,
+    pub disabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DependencyCondition {
+    #[default]
+    Started,
+    Healthy,
+    CompletedSuccessfully,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +215,8 @@ pub struct RawService {
     #[serde(default)]
     pub ulimits: IndexMap<String, Value>,
     #[serde(default)]
+    pub healthcheck: Option<RawHealthcheck>,
+    #[serde(default)]
     pub stop_signal: Option<String>,
     #[serde(default)]
     pub stop_grace_period: Option<String>,
@@ -202,6 +224,24 @@ pub struct RawService {
     pub restart: Option<String>,
     #[serde(default)]
     pub pull_policy: Option<String>,
+    #[serde(flatten)]
+    pub extra: IndexMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RawHealthcheck {
+    #[serde(default)]
+    pub test: Value,
+    #[serde(default)]
+    pub interval: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<String>,
+    #[serde(default)]
+    pub start_period: Option<String>,
+    #[serde(default)]
+    pub retries: Option<u32>,
+    #[serde(default)]
+    pub disable: bool,
     #[serde(flatten)]
     pub extra: IndexMap<String, Value>,
 }
@@ -325,6 +365,68 @@ fn normalize_ulimits(raw: &IndexMap<String, Value>) -> Result<IndexMap<String, S
     Ok(result)
 }
 
+fn normalize_healthcheck(raw: &RawHealthcheck) -> Result<Healthcheck> {
+    let mut disabled = raw.disable;
+    let command = match &raw.test {
+        Value::Null => None,
+        Value::String(command) => Some(command.clone()),
+        Value::Sequence(values) => {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "healthcheck.test entries must all be strings".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let Some((mode, arguments)) = values.split_first() else {
+                return Err(Error::InvalidConfig(
+                    "healthcheck.test must not be empty".to_owned(),
+                ));
+            };
+            match mode.as_str() {
+                "NONE" => {
+                    disabled = true;
+                    None
+                }
+                "CMD-SHELL" => Some(arguments.join(" ")),
+                "CMD" => Some(
+                    shlex::try_join(arguments.iter().map(String::as_str)).map_err(|error| {
+                        Error::InvalidConfig(format!(
+                            "could not quote healthcheck command arguments: {error}"
+                        ))
+                    })?,
+                ),
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "healthcheck.test mode must be CMD, CMD-SHELL, or NONE, got {mode}"
+                    )))
+                }
+            }
+        }
+        _ => {
+            return Err(Error::InvalidConfig(
+                "healthcheck.test must be a string or list".to_owned(),
+            ))
+        }
+    };
+    if raw.retries.is_some_and(|retries| retries > i32::MAX as u32) {
+        return Err(Error::InvalidConfig(
+            "healthcheck.retries exceeds the WSLC integer range".to_owned(),
+        ));
+    }
+    Ok(Healthcheck {
+        command,
+        interval: raw.interval.clone(),
+        timeout: raw.timeout.clone(),
+        start_period: raw.start_period.clone(),
+        retries: raw.retries,
+        disabled,
+    })
+}
+
 fn normalize_service(
     name: &str,
     raw: RawService,
@@ -391,7 +493,8 @@ fn normalize_service(
     environment.extend(parse_key_values(&raw.environment, host_env)?);
 
     let labels = parse_key_values(&raw.labels, host_env)?;
-    let depends_on = value_keys(&raw.depends_on)?;
+    let dependency_conditions = normalize_dependencies(&raw.depends_on)?;
+    let depends_on = dependency_conditions.keys().cloned().collect();
     let service_networks = normalize_service_networks(&raw.networks, networks)?;
     let mounts = raw
         .volumes
@@ -404,12 +507,21 @@ fn normalize_service(
         .filter_map(normalize_port)
         .collect::<Result<Vec<_>>>()?;
 
-    let unsupported = raw
+    let mut unsupported: Vec<_> = raw
         .extra
         .iter()
         .filter(|(_, value)| !value.is_null())
         .map(|(name, _)| name.clone())
         .collect();
+    if let Some(healthcheck) = &raw.healthcheck {
+        unsupported.extend(
+            healthcheck
+                .extra
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(name, _)| format!("healthcheck.{name}")),
+        );
+    }
 
     Ok(Service {
         name: name.to_owned(),
@@ -432,6 +544,7 @@ fn normalize_service(
         ports,
         mounts,
         depends_on,
+        dependency_conditions,
         profiles: raw.profiles,
         labels,
         networks: service_networks,
@@ -446,6 +559,11 @@ fn normalize_service(
         memory: raw.mem_limit.as_ref().and_then(scalar_string),
         cpus: raw.cpus.as_ref().and_then(scalar_string),
         ulimits: normalize_ulimits(&raw.ulimits)?,
+        healthcheck: raw
+            .healthcheck
+            .as_ref()
+            .map(normalize_healthcheck)
+            .transpose()?,
         stop_signal: raw.stop_signal.unwrap_or_else(|| "SIGTERM".to_owned()),
         stop_grace_period: raw
             .stop_grace_period
@@ -595,26 +713,52 @@ fn parse_key_values(value: &Value, host_env: &Environment) -> Result<IndexMap<St
     Ok(result)
 }
 
-fn value_keys(value: &Value) -> Result<Vec<String>> {
+fn normalize_dependencies(value: &Value) -> Result<IndexMap<String, DependencyCondition>> {
     match value {
-        Value::Null => Ok(Vec::new()),
-        Value::Sequence(values) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| Error::InvalidConfig("dependency must be a string".to_owned()))
-            })
-            .collect(),
-        Value::Mapping(mapping) => mapping
-            .keys()
-            .map(|key| {
-                key.as_str().map(str::to_owned).ok_or_else(|| {
+        Value::Null => Ok(IndexMap::new()),
+        Value::Sequence(values) => {
+            let mut dependencies = IndexMap::new();
+            for value in values {
+                let name = value.as_str().ok_or_else(|| {
+                    Error::InvalidConfig("dependency must be a string".to_owned())
+                })?;
+                dependencies.insert(name.to_owned(), DependencyCondition::Started);
+            }
+            Ok(dependencies)
+        }
+        Value::Mapping(mapping) => {
+            let mut dependencies = IndexMap::new();
+            for (key, options) in mapping {
+                let name = key.as_str().ok_or_else(|| {
                     Error::InvalidConfig("dependency key must be a string".to_owned())
-                })
-            })
-            .collect(),
+                })?;
+                let condition = match options {
+                    Value::Null => DependencyCondition::Started,
+                    Value::Mapping(options) => match mapping_get(options, "condition")
+                        .and_then(Value::as_str)
+                        .unwrap_or("service_started")
+                    {
+                        "service_started" => DependencyCondition::Started,
+                        "service_healthy" => DependencyCondition::Healthy,
+                        "service_completed_successfully" => {
+                            DependencyCondition::CompletedSuccessfully
+                        }
+                        condition => {
+                            return Err(Error::InvalidConfig(format!(
+                                "unsupported depends_on condition for {name}: {condition}"
+                            )))
+                        }
+                    },
+                    _ => {
+                        return Err(Error::InvalidConfig(format!(
+                            "depends_on options for {name} must be a map"
+                        )))
+                    }
+                };
+                dependencies.insert(name.to_owned(), condition);
+            }
+            Ok(dependencies)
+        }
         _ => Err(Error::InvalidConfig(
             "depends_on must be a list or map".to_owned(),
         )),
@@ -992,5 +1136,59 @@ mod tests {
     fn parses_compose_durations() {
         assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn normalizes_compose_healthcheck_for_wslc_cli() {
+        let raw: RawHealthcheck = serde_yaml::from_str(
+            r#"
+test: ["CMD", "redis-cli", "-h", "cache service", "ping"]
+interval: 5s
+timeout: 2s
+start_period: 10s
+retries: 4
+"#,
+        )
+        .unwrap();
+        let healthcheck = normalize_healthcheck(&raw).unwrap();
+        assert_eq!(
+            healthcheck.command.as_deref(),
+            Some("redis-cli -h 'cache service' ping")
+        );
+        assert_eq!(healthcheck.interval.as_deref(), Some("5s"));
+        assert_eq!(healthcheck.timeout.as_deref(), Some("2s"));
+        assert_eq!(healthcheck.start_period.as_deref(), Some("10s"));
+        assert_eq!(healthcheck.retries, Some(4));
+        assert!(!healthcheck.disabled);
+    }
+
+    #[test]
+    fn healthcheck_none_disables_image_healthcheck() {
+        let raw: RawHealthcheck = serde_yaml::from_str("test: [\"NONE\"]").unwrap();
+        let healthcheck = normalize_healthcheck(&raw).unwrap();
+        assert!(healthcheck.disabled);
+        assert!(healthcheck.command.is_none());
+    }
+
+    #[test]
+    fn normalizes_long_dependency_conditions() {
+        let value: Value = serde_yaml::from_str(
+            r#"
+database:
+  condition: service_healthy
+migrate:
+  condition: service_completed_successfully
+cache:
+  condition: service_started
+"#,
+        )
+        .unwrap();
+        let dependencies = normalize_dependencies(&value).unwrap();
+        assert_eq!(dependencies["database"], DependencyCondition::Healthy);
+        assert_eq!(
+            dependencies["migrate"],
+            DependencyCondition::CompletedSuccessfully
+        );
+        assert_eq!(dependencies["cache"], DependencyCondition::Started);
     }
 }

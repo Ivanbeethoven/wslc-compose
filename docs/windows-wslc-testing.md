@@ -77,8 +77,8 @@ executables from `$Backup` to `$WslInstall`, then start the service.
 
 ## Build wslc-rs and wslc-compose
 
-Clone the two Rust repositories as siblings because `wslc-compose` uses the
-local `../wslc-rs` path dependency for the current SDK API.
+`wslc-compose` uses the published `wslc` crate. Clone `wslc-rs` as well only
+when running its SDK integration tests or developing both projects together.
 
 ```powershell
 $Workspace = "D:\src"

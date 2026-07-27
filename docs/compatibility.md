@@ -15,7 +15,7 @@ deserialized through `compose_spec` before execution.
 | `up` | Supported | Create/start, pull policy, profiles, recreate |
 | `down` | Supported | Containers, networks, optional named volumes |
 | `start/stop/restart/kill/rm` | Supported | Deterministic Compose container names |
-| `ps` | Supported | Uses Compose project labels |
+| `ps` | Supported | Uses Compose project labels; service selection is exact |
 | `logs` | Partial | Follow mode currently supports one service |
 | `exec` | Supported | Env, user, workdir, TTY, interactive, detach |
 | `run` | Supported | One-off container, deps, env, ports, auto-remove |
@@ -28,8 +28,8 @@ deserialized through `compose_spec` before execution.
 | --- | --- | --- |
 | File discovery and multiple `-f` | Supported | Recursive map merge, sequence append |
 | `.env` and `${...}` interpolation | Supported | Default, required, alternate and `$$` forms |
-| `name`, `profiles`, `depends_on` | Supported | Dependency order; health conditions not awaited |
-| `image`, `pull_policy` | Partial | CLI pull policy wins; `missing` currently pulls |
+| `name`, `profiles`, `depends_on` | Partial | Dependency order plus started, healthy, and completed-successfully conditions; `required` and dependency `restart` remain pending |
+| `image`, `pull_policy` | Supported | CLI pull policy wins; `missing` inspects the resolved local image first |
 | `build` | Supported | WSLC Dockerfile builder backend |
 | `command`, `entrypoint` | Supported | String and list forms |
 | `environment`, `env_file` | Supported | Map/list and optional env files |
@@ -42,7 +42,7 @@ deserialized through `compose_spec` before execution.
 | `stop_signal`, `stop_grace_period` | Supported | Command timeout can override grace period |
 | `restart` | Parsed only | WSLC restart policy is not enforced yet |
 | `privileged` | Experimental | Uses a persistent local SDK daemon because SDK handles cannot be reopened by a later CLI process. On a WSL runtime with privileged FUSE support, the container receives `/dev/fuse`; explicit `devices`, capability additions, security options, and ulimits remain unsupported. |
-| `healthcheck` | Parsed only | No readiness wait in `depends_on` yet |
+| `healthcheck` | Partial | Commands, intervals, timeouts, start periods, retries, and disable are passed to `wslc.exe`; `start_interval` is not exposed by WSLC |
 | `secrets`, `configs` | Parsed only | Not mounted by the current backend |
 | `deploy` | Parsed only | Swarm/deployment semantics are out of scope |
 | `extends`, `include` | Validation only | Full cross-file materialization is pending |
@@ -63,4 +63,3 @@ fail before any containers are created rather than silently changing semantics.
 4. Compose merge supports recursive mappings and appended sequences. Advanced
    Compose tags such as `!reset` and unique-resource sequence replacement are
    planned.
-5. `--remove-orphans` is accepted but currently reports a warning.

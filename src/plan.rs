@@ -130,6 +130,10 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            dependency_conditions: dependencies
+                .iter()
+                .map(|value| ((*value).to_owned(), Default::default()))
+                .collect(),
             profiles: profiles.iter().map(|value| (*value).to_owned()).collect(),
             labels: IndexMap::new(),
             networks: Vec::new(),
@@ -144,6 +148,7 @@ mod tests {
             memory: None,
             cpus: None,
             ulimits: IndexMap::new(),
+            healthcheck: None,
             stop_signal: "SIGTERM".to_owned(),
             stop_grace_period: std::time::Duration::from_secs(10),
             restart: None,
