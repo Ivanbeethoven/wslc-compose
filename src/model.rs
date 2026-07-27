@@ -18,7 +18,7 @@ pub struct Project {
     pub volumes: IndexMap<String, Resource>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Service {
     pub name: String,
     pub image: Option<String>,
@@ -52,7 +52,7 @@ pub struct Service {
     pub unsupported: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct BuildConfig {
     pub context: PathBuf,
     pub dockerfile: Option<PathBuf>,
@@ -63,7 +63,7 @@ pub struct BuildConfig {
     pub generated_tag: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Healthcheck {
     pub command: Option<String>,
     pub interval: Option<String>,
@@ -73,7 +73,7 @@ pub struct Healthcheck {
     pub disabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub enum DependencyCondition {
     #[default]
     Started,
@@ -81,7 +81,7 @@ pub enum DependencyCondition {
     CompletedSuccessfully,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Mount {
     Bind {
         source: PathBuf,
@@ -135,7 +135,7 @@ fn mount_value(source: &str, target: &str, read_only: bool) -> String {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ServiceNetwork {
     pub name: String,
     pub aliases: Vec<String>,

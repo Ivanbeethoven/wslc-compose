@@ -1,10 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::model::{BuildConfig, DependencyCondition, Mount, Project, Resource, Service};
 use crate::sdk_daemon::Client as SdkClient;
@@ -12,6 +15,7 @@ use crate::{Error, Result};
 
 const DEPENDENCY_WAIT_TIMEOUT_ENV: &str = "WSLC_COMPOSE_WAIT_TIMEOUT_SECS";
 const DEFAULT_DEPENDENCY_WAIT_TIMEOUT_SECS: u64 = 120;
+const CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 
 pub struct WslcBackend {
     program: OsString,
@@ -69,6 +73,8 @@ struct ListedContainer {
 struct InspectedContainer {
     #[serde(rename = "State")]
     state: InspectedContainerState,
+    #[serde(rename = "Labels", default)]
+    labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +125,12 @@ impl WslcBackend {
         let image = resolve_image_reference(image)?;
         let status = self.status_quiet(&["image".to_owned(), "inspect".to_owned(), image])?;
         Ok(status.success())
+    }
+
+    pub fn container_matches_configuration(&self, name: &str, service: &Service) -> Result<bool> {
+        let expected = service_config_hash(service)?;
+        let inspected = self.inspect_container(name)?;
+        Ok(inspected.labels.get(CONFIG_HASH_LABEL) == Some(&expected))
     }
 
     pub fn build(
@@ -462,24 +474,93 @@ impl WslcBackend {
                 feature: "logs are not exposed by the current WSLC SDK".to_owned(),
             });
         }
-        let mut args = vec!["logs".to_owned()];
-        if options.follow {
-            args.push("--follow".to_owned());
+        self.inherit(&log_args(name, options))
+    }
+
+    pub fn logs_many(&self, services: &[(String, String)], options: &LogOptions<'_>) -> Result<()> {
+        if services.len() == 1 {
+            return self.logs(&services[0].1, options);
         }
-        if let Some(tail) = options.tail {
-            args.extend(["--tail".to_owned(), tail.to_string()]);
+        for (service, container) in services {
+            if self.sdk.existing(container)?.unwrap_or(false) {
+                return Err(Error::Unsupported {
+                    service: service.clone(),
+                    feature: "logs are not exposed by the current WSLC SDK".to_owned(),
+                });
+            }
         }
-        if options.timestamps {
-            args.push("--timestamps".to_owned());
+
+        let width = services
+            .iter()
+            .map(|(service, _)| service.len())
+            .max()
+            .unwrap_or_default();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let stderr = Arc::new(Mutex::new(io::stderr()));
+        let mut children: Vec<(std::process::Child, Vec<String>)> =
+            Vec::with_capacity(services.len());
+        let mut readers = Vec::with_capacity(services.len() * 2);
+
+        for (service, container) in services {
+            let args = log_args(container, options);
+            let mut child = match Command::new(&self.program)
+                .args(&args)
+                .current_dir(&self.working_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    for (running, _) in &mut children {
+                        let _ = running.kill();
+                    }
+                    return Err(Error::StartWslc(error));
+                }
+            };
+            let child_stdout = child.stdout.take().expect("piped stdout");
+            let child_stderr = child.stderr.take().expect("piped stderr");
+            let stdout = Arc::clone(&stdout);
+            let stderr = Arc::clone(&stderr);
+            let stdout_prefix = service.clone();
+            let stderr_prefix = service.clone();
+            readers.push(std::thread::spawn(move || {
+                write_prefixed_lines(child_stdout, stdout, &stdout_prefix, width)
+            }));
+            readers.push(std::thread::spawn(move || {
+                write_prefixed_lines(child_stderr, stderr, &stderr_prefix, width)
+            }));
+            children.push((child, args));
         }
-        if let Some(since) = options.since {
-            args.extend(["--since".to_owned(), since.to_owned()]);
+
+        let mut command_failure = None;
+        for (child, args) in &mut children {
+            let status = child.wait().map_err(Error::StartWslc)?;
+            if !status.success() && command_failure.is_none() {
+                command_failure = Some(Error::WslcCommand {
+                    command: args.join(" "),
+                    code: status.code().unwrap_or(-1),
+                    message: "see prefixed wslc output above".to_owned(),
+                });
+            }
         }
-        if let Some(until) = options.until {
-            args.extend(["--until".to_owned(), until.to_owned()]);
+        for reader in readers {
+            reader
+                .join()
+                .map_err(|_| Error::LogStream("log reader thread panicked".to_owned()))?
+                .map_err(|error| Error::LogStream(error.to_string()))?;
         }
-        args.push(name.to_owned());
-        self.inherit(&args)
+        command_failure.map_or(Ok(()), Err)
+    }
+
+    pub fn stats(&self, name: &str, all: bool, no_trunc: bool, json: bool) -> Result<()> {
+        if self.sdk.existing(name)?.unwrap_or(false) {
+            return Err(Error::Unsupported {
+                service: name.to_owned(),
+                feature: "stats are not exposed by the current WSLC SDK".to_owned(),
+            });
+        }
+        self.inherit(&stats_args(name, all, no_trunc, json))
     }
 
     pub fn exec(&self, name: &str, options: ExecOptions<'_>) -> Result<()> {
@@ -574,6 +655,10 @@ impl WslcBackend {
     }
 
     fn inspect_container_state(&self, name: &str) -> Result<InspectedContainerState> {
+        Ok(self.inspect_container(name)?.state)
+    }
+
+    fn inspect_container(&self, name: &str) -> Result<InspectedContainer> {
         let output = self.capture(&[
             "inspect".to_owned(),
             "--type".to_owned(),
@@ -581,14 +666,9 @@ impl WslcBackend {
             name.to_owned(),
         ])?;
         let mut containers: Vec<InspectedContainer> = serde_json::from_str(&output)?;
-        containers
-            .pop()
-            .map(|container| container.state)
-            .ok_or_else(|| {
-                Error::InvalidConfig(format!(
-                    "wslc inspect returned no state for dependency {name}"
-                ))
-            })
+        containers.pop().ok_or_else(|| {
+            Error::InvalidConfig(format!("wslc inspect returned no container for {name}"))
+        })
     }
 
     fn capture(&self, args: &[String]) -> Result<String> {
@@ -680,6 +760,157 @@ fn orphan_names(mut existing: Vec<String>, expected: &BTreeSet<&str>) -> Vec<Str
 
 fn dependency_wait_timeout() -> Result<Option<Duration>> {
     parse_dependency_wait_timeout(std::env::var(DEPENDENCY_WAIT_TIMEOUT_ENV).ok().as_deref())
+}
+
+pub(crate) fn service_config_hash(service: &Service) -> Result<String> {
+    #[derive(Serialize)]
+    struct RuntimeConfig<'a> {
+        image: String,
+        command: &'a [String],
+        entrypoint: &'a [String],
+        environment: &'a BTreeMap<String, String>,
+        ports: &'a [String],
+        mounts: &'a [Mount],
+        labels: &'a BTreeMap<String, String>,
+        networks: &'a [crate::model::ServiceNetwork],
+        hostname: &'a Option<String>,
+        domain_name: &'a Option<String>,
+        privileged: bool,
+        working_dir: &'a Option<String>,
+        user: &'a Option<String>,
+        tty: bool,
+        stdin_open: bool,
+        gpus: bool,
+        memory: &'a Option<String>,
+        cpus: &'a Option<String>,
+        ulimits: &'a BTreeMap<String, String>,
+        healthcheck: &'a Option<crate::model::Healthcheck>,
+        stop_signal: &'a str,
+    }
+
+    let image = service
+        .image
+        .as_deref()
+        .ok_or_else(|| Error::MissingImage {
+            service: service.name.clone(),
+        })?;
+    let image = if service.build.is_some() {
+        image.to_owned()
+    } else {
+        resolve_image_reference(image)?
+    };
+    let environment = service
+        .environment
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let labels = service
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let ulimits = service
+        .ulimits
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let config = RuntimeConfig {
+        image,
+        command: &service.command,
+        entrypoint: &service.entrypoint,
+        environment: &environment,
+        ports: &service.ports,
+        mounts: &service.mounts,
+        labels: &labels,
+        networks: &service.networks,
+        hostname: &service.hostname,
+        domain_name: &service.domain_name,
+        privileged: service.privileged,
+        working_dir: &service.working_dir,
+        user: &service.user,
+        tty: service.tty,
+        stdin_open: service.stdin_open,
+        gpus: service.gpus,
+        memory: &service.memory,
+        cpus: &service.cpus,
+        ulimits: &ulimits,
+        healthcheck: &service.healthcheck,
+        stop_signal: &service.stop_signal,
+    };
+    let encoded = serde_json::to_vec(&config)?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!("sha256:{digest:x}"))
+}
+
+fn log_args(name: &str, options: &LogOptions<'_>) -> Vec<String> {
+    let mut args = vec!["logs".to_owned()];
+    if options.follow {
+        args.push("--follow".to_owned());
+    }
+    if let Some(tail) = options.tail {
+        args.extend(["--tail".to_owned(), tail.to_string()]);
+    }
+    if options.timestamps {
+        args.push("--timestamps".to_owned());
+    }
+    if let Some(since) = options.since {
+        args.extend(["--since".to_owned(), since.to_owned()]);
+    }
+    if let Some(until) = options.until {
+        args.extend(["--until".to_owned(), until.to_owned()]);
+    }
+    args.push(name.to_owned());
+    args
+}
+
+fn stats_args(name: &str, all: bool, no_trunc: bool, json: bool) -> Vec<String> {
+    let mut args = vec!["stats".to_owned()];
+    if all {
+        args.push("--all".to_owned());
+    }
+    if no_trunc {
+        args.push("--no-trunc".to_owned());
+    }
+    args.extend([
+        "--format".to_owned(),
+        if json { "json" } else { "table" }.to_owned(),
+        name.to_owned(),
+    ]);
+    args
+}
+
+fn write_prefixed_lines<R, W>(
+    reader: R,
+    writer: Arc<Mutex<W>>,
+    prefix: &str,
+    width: usize,
+) -> io::Result<()>
+where
+    R: io::Read,
+    W: Write,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let mut writer = writer
+            .lock()
+            .map_err(|_| io::Error::other("log output lock poisoned"))?;
+        write!(writer, "{prefix:width$} | ")?;
+        writer.write_all(&line)?;
+        writeln!(writer)?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 fn parse_dependency_wait_timeout(value: Option<&str>) -> Result<Option<Duration>> {
@@ -811,6 +1042,7 @@ fn create_args(
         "com.docker.compose.service".to_owned(),
         service.name.clone(),
     );
+    labels.insert(CONFIG_HASH_LABEL.to_owned(), service_config_hash(service)?);
     labels.insert(
         "com.docker.compose.oneoff".to_owned(),
         auto_remove.to_string(),
@@ -990,6 +1222,9 @@ mod tests {
         assert!(args
             .iter()
             .any(|value| value == "com.docker.compose.project=demo"));
+        assert!(args
+            .iter()
+            .any(|value| value.starts_with("com.docker.compose.config-hash=sha256:")));
         assert!(args.iter().any(|value| value == "MODE=test"));
         assert!(args
             .windows(2)
@@ -1079,5 +1314,88 @@ mod tests {
         );
         assert_eq!(parse_dependency_wait_timeout(Some("0")).unwrap(), None);
         assert!(parse_dependency_wait_timeout(Some("later")).is_err());
+    }
+
+    #[test]
+    fn service_config_hash_is_stable_and_tracks_runtime_changes() {
+        let (_, mut service) = project_and_service();
+        let original = service_config_hash(&service).unwrap();
+        assert_eq!(original, service_config_hash(&service).unwrap());
+        assert_eq!(original.len(), "sha256:".len() + 64);
+
+        service.command.push("changed".to_owned());
+        assert_ne!(original, service_config_hash(&service).unwrap());
+    }
+
+    #[test]
+    fn service_config_hash_ignores_mapping_and_dependency_order() {
+        let (_, mut service) = project_and_service();
+        service.environment = IndexMap::from([
+            ("FIRST".to_owned(), "1".to_owned()),
+            ("SECOND".to_owned(), "2".to_owned()),
+        ]);
+        service.depends_on = vec!["db".to_owned(), "cache".to_owned()];
+        let original = service_config_hash(&service).unwrap();
+
+        service.environment = IndexMap::from([
+            ("SECOND".to_owned(), "2".to_owned()),
+            ("FIRST".to_owned(), "1".to_owned()),
+        ]);
+        service.depends_on.reverse();
+        assert_eq!(original, service_config_hash(&service).unwrap());
+    }
+
+    #[test]
+    fn log_arguments_preserve_all_filters() {
+        let args = log_args(
+            "demo-web-1",
+            &LogOptions {
+                follow: true,
+                tail: Some(20),
+                timestamps: true,
+                since: Some("100"),
+                until: Some("200"),
+            },
+        );
+        assert_eq!(
+            args,
+            [
+                "logs",
+                "--follow",
+                "--tail",
+                "20",
+                "--timestamps",
+                "--since",
+                "100",
+                "--until",
+                "200",
+                "demo-web-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn stats_arguments_select_exact_container_and_output_options() {
+        assert_eq!(
+            stats_args("demo-web-1", true, true, true),
+            [
+                "stats",
+                "--all",
+                "--no-trunc",
+                "--format",
+                "json",
+                "demo-web-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn prefixes_each_log_line_for_multiplexed_output() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        write_prefixed_lines("one\ntwo\n".as_bytes(), Arc::clone(&output), "web", 6).unwrap();
+        assert_eq!(
+            String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+            "web    | one\nweb    | two\n"
+        );
     }
 }

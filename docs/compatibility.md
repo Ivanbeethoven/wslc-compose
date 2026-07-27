@@ -12,21 +12,22 @@ deserialized through `compose_spec` before execution.
 | `pull` | Supported | Honors WSLC registry mirror variables |
 | `build` | Supported | Context, Dockerfile, args, target, labels |
 | `create` | Supported | Dependency order and project resources |
-| `up` | Supported | Create/start, pull policy, profiles, recreate |
+| `up` | Supported | Create/start, pull policy, profiles, configuration-aware recreation, attached multi-service logs |
 | `down` | Supported | Containers, networks, optional named volumes |
 | `start/stop/restart/kill/rm` | Supported | Deterministic Compose container names |
 | `ps` | Supported | Uses Compose project labels; service selection is exact |
-| `logs` | Partial | Follow mode currently supports one service |
+| `logs` | Supported | Multiple services and follow mode with prefixed multiplexed output |
+| `stats` | Supported | Per-service WSLC resource snapshots; WSLC does not expose Docker's continuous stream |
 | `exec` | Supported | Env, user, workdir, TTY, interactive, detach |
 | `run` | Supported | One-off container, deps, env, ports, auto-remove |
-| `events/stats/top/pause/unpause` | Not yet | Requires additional WSLC command modeling |
+| `events/top/pause/unpause` | Not yet | Not exposed by the current WSLC CLI |
 | `watch` | Not yet | Compose develop/watch is not implemented |
 
 ## Compose Fields
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| File discovery and multiple `-f` | Supported | Recursive map merge, sequence append |
+| File discovery and multiple `-f` | Supported | Recursive map merge; shell commands replace; ordinary sequences append |
 | `.env` and `${...}` interpolation | Supported | Default, required, alternate and `$$` forms |
 | `name`, `profiles`, `depends_on` | Partial | Dependency order plus started, healthy, and completed-successfully conditions; `required` and dependency `restart` remain pending |
 | `image`, `pull_policy` | Supported | CLI pull policy wins; `missing` inspects the resolved local image first |
@@ -56,10 +57,9 @@ fail before any containers are created rather than silently changing semantics.
 
 1. `up` runs containers in the WSLC global control plane. It does not create a
    Docker daemon or Docker API socket.
-2. Multi-service attached log multiplexing is not implemented. Use `up -d`
-   followed by `logs <service>`.
-3. Default recreation currently uses deterministic existing containers. Use
-   `--force-recreate` after changing container settings.
-4. Compose merge supports recursive mappings and appended sequences. Advanced
+2. `stats` reflects the WSLC command's point-in-time snapshot rather than the
+   continuously refreshed Docker Compose display.
+3. Compose merge supports recursive mappings, appended ordinary sequences, and
+   replacement of `command`, `entrypoint`, and `healthcheck.test`. Advanced
    Compose tags such as `!reset` and unique-resource sequence replacement are
    planned.

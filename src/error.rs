@@ -43,6 +43,9 @@ pub enum Error {
     #[error("failed to start wslc.exe: {0}")]
     StartWslc(#[source] std::io::Error),
 
+    #[error("failed to stream container logs: {0}")]
+    LogStream(String),
+
     #[error("wslc {command} failed with exit code {code}: {message}")]
     WslcCommand {
         command: String,

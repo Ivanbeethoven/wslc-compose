@@ -8,7 +8,8 @@ official `wslc.exe` control plane.
 wslc-compose config
 wslc-compose up -d
 wslc-compose ps
-wslc-compose logs web
+wslc-compose logs -f web worker
+wslc-compose stats web worker
 wslc-compose exec web sh
 wslc-compose down --volumes
 ```
@@ -29,7 +30,7 @@ Implemented commands:
 
 - `config`, `pull`, `build`, `create`, `up`, `down`
 - `start`, `stop`, `restart`, `kill`, `rm`
-- `ps`, `logs`, `exec`, `run`, `version`
+- `ps`, `logs`, `stats`, `exec`, `run`, `version`
 
 Implemented Compose behavior includes configuration discovery, multiple `-f`
 files, `.env`, parameter expansion, profiles, dependency ordering, images,
@@ -157,6 +158,30 @@ wslc-compose -f examples/healthcheck/compose.yaml down
 Dependency waits default to 120 seconds. Set
 `WSLC_COMPOSE_WAIT_TIMEOUT_SECS=0` to wait indefinitely, or provide another
 non-negative number of seconds.
+
+The `examples/recreate` project exercises automatic configuration-change
+recreation and multiplexed logs without embedding a registry endpoint:
+
+```powershell
+wslc-compose -f examples/recreate/compose.yaml up -d --pull never
+wslc-compose -f examples/recreate/compose.yaml up -d --pull never
+wslc-compose -f examples/recreate/compose.yaml `
+  -f examples/recreate/compose.changed.yaml up -d --pull never
+wslc-compose -f examples/recreate/compose.yaml logs -f web worker
+wslc-compose -f examples/recreate/compose.yaml stats web worker
+wslc-compose -f examples/recreate/compose.yaml down --volumes
+```
+
+An unchanged service keeps its existing container. Changes to applied runtime
+configuration recreate it automatically; `--no-recreate` and
+`--force-recreate` override that decision.
+
+Run the complete real-runtime regression after building a release binary:
+
+```powershell
+cargo build --release --locked
+.\scripts\real-wslc-smoke.ps1
+```
 
 ## Architecture
 

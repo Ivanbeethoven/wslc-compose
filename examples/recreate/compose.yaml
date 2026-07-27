@@ -1,0 +1,12 @@
+name: recreate-demo
+
+services:
+  web:
+    image: ${WSLC_COMPOSE_IMAGE:-docker.io/library/alpine:latest}
+    command: ["sh", "-c", "echo web-v1; sleep 3"]
+    environment:
+      DEMO_VERSION: v1
+
+  worker:
+    image: ${WSLC_COMPOSE_IMAGE:-docker.io/library/alpine:latest}
+    command: ["sh", "-c", "echo worker-v1; sleep 3"]

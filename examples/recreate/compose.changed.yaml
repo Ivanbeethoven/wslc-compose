@@ -1,0 +1,4 @@
+services:
+  web:
+    environment:
+      DEMO_VERSION: v2

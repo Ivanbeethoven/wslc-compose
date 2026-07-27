@@ -217,19 +217,40 @@ fn interpolate_value(value: &mut Value, environment: &Environment) -> Result<()>
 }
 
 pub fn merge(base: &mut Value, overlay: Value) {
+    merge_at(base, overlay, &mut Vec::new());
+}
+
+fn merge_at(base: &mut Value, overlay: Value, path: &mut Vec<String>) {
     match (base, overlay) {
         (Value::Mapping(base), Value::Mapping(overlay)) => {
             for (key, value) in overlay {
                 if let Some(existing) = base.get_mut(&key) {
-                    merge(existing, value);
+                    if let Some(segment) = key.as_str() {
+                        path.push(segment.to_owned());
+                        merge_at(existing, value, path);
+                        path.pop();
+                    } else {
+                        merge_at(existing, value, path);
+                    }
                 } else {
                     base.insert(key, value);
                 }
             }
         }
-        (Value::Sequence(base), Value::Sequence(mut overlay)) => base.append(&mut overlay),
+        (Value::Sequence(base), Value::Sequence(mut overlay)) => {
+            if sequence_is_shell_command(path) {
+                *base = overlay;
+            } else {
+                base.append(&mut overlay);
+            }
+        }
         (base, overlay) => *base = overlay,
     }
+}
+
+fn sequence_is_shell_command(path: &[String]) -> bool {
+    matches!(path, [services, _, command] if services == "services" && matches!(command.as_str(), "command" | "entrypoint"))
+        || matches!(path, [services, _, healthcheck, test] if services == "services" && healthcheck == "healthcheck" && test == "test")
 }
 
 #[cfg(test)]
@@ -249,6 +270,31 @@ mod tests {
         assert!(text.contains("image: new"));
         assert!(text.contains("80:80"));
         assert!(text.contains("443:443"));
+    }
+
+    #[test]
+    fn compose_shell_commands_replace_instead_of_append() {
+        let mut base: Value = serde_yaml::from_str(
+            "services:\n  web:\n    command: [old, argument]\n    entrypoint: [old-entrypoint]\n    healthcheck:\n      test: [CMD, old-health]\n",
+        )
+        .unwrap();
+        let overlay: Value = serde_yaml::from_str(
+            "services:\n  web:\n    command: [new]\n    entrypoint: [new-entrypoint]\n    healthcheck:\n      test: [CMD-SHELL, new-health]\n",
+        )
+        .unwrap();
+        merge(&mut base, overlay);
+        assert_eq!(
+            base["services"]["web"]["command"],
+            serde_yaml::from_str::<Value>("[new]").unwrap()
+        );
+        assert_eq!(
+            base["services"]["web"]["entrypoint"],
+            serde_yaml::from_str::<Value>("[new-entrypoint]").unwrap()
+        );
+        assert_eq!(
+            base["services"]["web"]["healthcheck"]["test"],
+            serde_yaml::from_str::<Value>("[CMD-SHELL, new-health]").unwrap()
+        );
     }
 
     #[test]
