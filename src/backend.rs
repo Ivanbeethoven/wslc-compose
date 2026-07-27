@@ -578,6 +578,13 @@ fn create_args(
 }
 
 pub(crate) fn resolve_image_reference(image: &str) -> Result<String> {
+    resolve_image_reference_with(image, |key| std::env::var(key).ok())
+}
+
+fn resolve_image_reference_with<F>(image: &str, mut env: F) -> Result<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let (registry, remainder) = split_registry(image);
     let env_key = if registry == "docker.io" {
         "WSLC_REGISTRY_MIRROR".to_owned()
@@ -594,7 +601,7 @@ pub(crate) fn resolve_image_reference(image: &str) -> Result<String> {
                 .collect::<String>()
         )
     };
-    let Ok(mirror) = std::env::var(&env_key) else {
+    let Some(mirror) = env(&env_key) else {
         return Ok(image.to_owned());
     };
     let mirror = mirror.trim().trim_end_matches('/');
@@ -703,9 +710,9 @@ mod tests {
 
     #[test]
     fn mirror_configuration_rejects_urls() {
-        std::env::set_var("WSLC_REGISTRY_MIRROR", "https://mirror.example.com");
-        let result = resolve_image_reference("alpine:latest");
-        std::env::remove_var("WSLC_REGISTRY_MIRROR");
+        let result = resolve_image_reference_with("alpine:latest", |key| {
+            (key == "WSLC_REGISTRY_MIRROR").then(|| "https://mirror.example.com".to_owned())
+        });
         assert!(result.unwrap_err().to_string().contains("not a URL"));
     }
 }
