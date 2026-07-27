@@ -65,7 +65,7 @@ the [Windows WSLC test guide](docs/windows-wslc-testing.md).
 ```powershell
 git clone https://github.com/Ivanbeethoven/wslc-compose.git
 cd wslc-compose
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ## Compose Example
@@ -144,6 +144,19 @@ wslc-compose -f examples/build/compose.yaml build
 wslc-compose -f examples/build/compose.yaml up -d --no-build --pull never
 wslc-compose -f examples/build/compose.yaml down
 ```
+
+The `examples/healthcheck` project exercises WSLC-native container health
+configuration and waits for `service_healthy` before starting its consumer:
+
+```powershell
+wslc-compose -f examples/healthcheck/compose.yaml up -d
+wslc inspect --type container healthcheck-demo-probe-1
+wslc-compose -f examples/healthcheck/compose.yaml down
+```
+
+Dependency waits default to 120 seconds. Set
+`WSLC_COMPOSE_WAIT_TIMEOUT_SECS=0` to wait indefinitely, or provide another
+non-negative number of seconds.
 
 ## Architecture
 

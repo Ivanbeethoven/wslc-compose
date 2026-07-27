@@ -1,10 +1,17 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::model::{BuildConfig, Mount, Project, Resource, Service};
+use serde::{Deserialize, Serialize};
+
+use crate::model::{BuildConfig, DependencyCondition, Mount, Project, Resource, Service};
 use crate::sdk_daemon::Client as SdkClient;
 use crate::{Error, Result};
+
+const DEPENDENCY_WAIT_TIMEOUT_ENV: &str = "WSLC_COMPOSE_WAIT_TIMEOUT_SECS";
+const DEFAULT_DEPENDENCY_WAIT_TIMEOUT_SECS: u64 = 120;
 
 pub struct WslcBackend {
     program: OsString,
@@ -44,6 +51,44 @@ pub struct LogOptions<'a> {
     pub until: Option<&'a str>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ListedContainer {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Image")]
+    image: String,
+    #[serde(rename = "State")]
+    state: i32,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectedContainer {
+    #[serde(rename = "State")]
+    state: InspectedContainerState,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectedContainerState {
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "Running")]
+    running: bool,
+    #[serde(rename = "ExitCode")]
+    exit_code: i32,
+    #[serde(rename = "Health")]
+    health: Option<InspectedHealth>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectedHealth {
+    #[serde(rename = "Status")]
+    status: String,
+}
+
 impl WslcBackend {
     pub fn new(working_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -66,11 +111,23 @@ impl WslcBackend {
         })
     }
 
-    pub fn pull(&self, image: &str) -> Result<()> {
-        self.inherit(&["pull".to_owned(), resolve_image_reference(image)?])
+    pub fn pull(&self, image: &str, quiet: bool) -> Result<()> {
+        self.inherit_with_quiet(&["pull".to_owned(), resolve_image_reference(image)?], quiet)
     }
 
-    pub fn build(&self, build: &BuildConfig, no_cache: bool, pull: bool) -> Result<()> {
+    pub fn image_exists(&self, image: &str) -> Result<bool> {
+        let image = resolve_image_reference(image)?;
+        let status = self.status_quiet(&["image".to_owned(), "inspect".to_owned(), image])?;
+        Ok(status.success())
+    }
+
+    pub fn build(
+        &self,
+        build: &BuildConfig,
+        no_cache: bool,
+        pull: bool,
+        quiet: bool,
+    ) -> Result<()> {
         let mut args = vec!["build".to_owned(), "--tag".to_owned(), build.tag.clone()];
         if no_cache {
             args.push("--no-cache".to_owned());
@@ -91,7 +148,7 @@ impl WslcBackend {
             args.extend(["--label".to_owned(), format!("{key}={value}")]);
         }
         args.push(build.context.display().to_string());
-        self.inherit(&args)
+        self.inherit_with_quiet(&args, quiet)
     }
 
     pub fn ensure_project_resources(&self, project: &Project) -> Result<()> {
@@ -256,9 +313,22 @@ impl WslcBackend {
         self.inherit(&args)
     }
 
-    pub fn ps(&self, project: &Project, all: bool, quiet: bool, json: bool) -> Result<()> {
+    pub fn ps(
+        &self,
+        project: &Project,
+        all: bool,
+        quiet: bool,
+        json: bool,
+        container_names: &[String],
+    ) -> Result<()> {
         if self.uses_sdk_project(project) {
-            let containers = self.sdk.list(&project.name)?.unwrap_or_default();
+            let mut containers = self.sdk.list(&project.name)?.unwrap_or_default();
+            if !all {
+                containers.retain(|container| container.state == "Running");
+            }
+            if !container_names.is_empty() {
+                containers.retain(|container| container_names.contains(&container.name));
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&containers)?);
             } else if quiet {
@@ -273,20 +343,116 @@ impl WslcBackend {
             }
             return Ok(());
         }
-        let mut args = vec!["list".to_owned()];
-        if all {
-            args.push("--all".to_owned());
+        if container_names.is_empty() {
+            return self.inherit(&project_list_args(project, all, quiet, json));
         }
-        args.extend([
-            "--filter".to_owned(),
-            format!("label=com.docker.compose.project={}", project.name),
-        ]);
-        if quiet {
-            args.push("--quiet".to_owned());
-        } else if json {
-            args.extend(["--format".to_owned(), "json".to_owned()]);
+
+        let mut containers = self.list_project_containers(project, all)?;
+        containers.retain(|container| container_names.contains(&container.name));
+        if json {
+            println!("{}", serde_json::to_string_pretty(&containers)?);
+        } else if quiet {
+            for container in containers {
+                println!("{}", container.id);
+            }
+        } else {
+            println!("CONTAINER ID\tNAME\tIMAGE\tSTATE");
+            for container in containers {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    truncate_id(&container.id),
+                    container.name,
+                    container.image,
+                    container_state(container.state)
+                );
+            }
         }
-        self.inherit(&args)
+        Ok(())
+    }
+
+    pub fn remove_orphans(&self, project: &Project) -> Result<Vec<String>> {
+        let expected: BTreeSet<&str> = project
+            .services
+            .values()
+            .map(|service| service.container_name.as_str())
+            .collect();
+        let existing = if self.uses_sdk_project(project) {
+            self.sdk
+                .list(&project.name)?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|container| container.name)
+                .collect()
+        } else {
+            self.list_project_containers(project, true)?
+                .into_iter()
+                .map(|container| container.name)
+                .collect::<Vec<_>>()
+        };
+        let orphans = orphan_names(existing, &expected);
+        for name in &orphans {
+            self.remove(name, true)?;
+        }
+        Ok(orphans)
+    }
+
+    pub fn wait_for_dependency(&self, name: &str, condition: DependencyCondition) -> Result<()> {
+        if condition == DependencyCondition::Started {
+            return Ok(());
+        }
+        if self.sdk.existing(name)?.unwrap_or(false) {
+            return Err(Error::Unsupported {
+                service: name.to_owned(),
+                feature: "depends_on conditions are not exposed by the WSLC SDK backend".to_owned(),
+            });
+        }
+
+        let timeout = dependency_wait_timeout()?;
+        let started = Instant::now();
+        loop {
+            let state = self.inspect_container_state(name)?;
+            match condition {
+                DependencyCondition::Started => return Ok(()),
+                DependencyCondition::Healthy => {
+                    let Some(health) = state.health else {
+                        return Err(Error::InvalidConfig(format!(
+                            "dependency {name} uses service_healthy but has no healthcheck"
+                        )));
+                    };
+                    if health.status.eq_ignore_ascii_case("healthy") {
+                        return Ok(());
+                    }
+                    if !state.running {
+                        return Err(Error::InvalidConfig(format!(
+                            "dependency {name} stopped before becoming healthy"
+                        )));
+                    }
+                }
+                DependencyCondition::CompletedSuccessfully => {
+                    if state.status.eq_ignore_ascii_case("exited") {
+                        if state.exit_code == 0 {
+                            return Ok(());
+                        }
+                        return Err(Error::InvalidConfig(format!(
+                            "dependency {name} exited with status {}",
+                            state.exit_code
+                        )));
+                    }
+                    if !state.running && !state.status.eq_ignore_ascii_case("created") {
+                        return Err(Error::InvalidConfig(format!(
+                            "dependency {name} entered unexpected state {}",
+                            state.status
+                        )));
+                    }
+                }
+            }
+            if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                return Err(Error::InvalidConfig(format!(
+                    "timed out waiting for dependency {name} to satisfy {condition:?}"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     pub fn logs(&self, name: &str, options: &LogOptions<'_>) -> Result<()> {
@@ -398,6 +564,33 @@ impl WslcBackend {
         ])
     }
 
+    fn list_project_containers(
+        &self,
+        project: &Project,
+        all: bool,
+    ) -> Result<Vec<ListedContainer>> {
+        let output = self.capture(&project_list_args(project, all, false, true))?;
+        serde_json::from_str(&output).map_err(Error::Json)
+    }
+
+    fn inspect_container_state(&self, name: &str) -> Result<InspectedContainerState> {
+        let output = self.capture(&[
+            "inspect".to_owned(),
+            "--type".to_owned(),
+            "container".to_owned(),
+            name.to_owned(),
+        ])?;
+        let mut containers: Vec<InspectedContainer> = serde_json::from_str(&output)?;
+        containers
+            .pop()
+            .map(|container| container.state)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "wslc inspect returned no state for dependency {name}"
+                ))
+            })
+    }
+
     fn capture(&self, args: &[String]) -> Result<String> {
         let output = Command::new(&self.program)
             .args(args)
@@ -421,11 +614,16 @@ impl WslcBackend {
     }
 
     fn inherit(&self, args: &[String]) -> Result<()> {
-        let status = Command::new(&self.program)
-            .args(args)
-            .current_dir(&self.working_dir)
-            .status()
-            .map_err(Error::StartWslc)?;
+        self.inherit_with_quiet(args, false)
+    }
+
+    fn inherit_with_quiet(&self, args: &[String], quiet: bool) -> Result<()> {
+        let mut command = Command::new(&self.program);
+        command.args(args).current_dir(&self.working_dir);
+        if quiet {
+            command.stdout(Stdio::null());
+        }
+        let status = command.status().map_err(Error::StartWslc)?;
         if !status.success() {
             return Err(Error::WslcCommand {
                 command: args.join(" "),
@@ -438,6 +636,62 @@ impl WslcBackend {
     pub fn uses_sdk_project(&self, project: &Project) -> bool {
         SdkClient::project_uses_sdk(project)
     }
+}
+
+fn project_list_args(project: &Project, all: bool, quiet: bool, json: bool) -> Vec<String> {
+    let mut args = vec!["list".to_owned()];
+    if all {
+        args.push("--all".to_owned());
+    }
+    args.extend([
+        "--filter".to_owned(),
+        format!("label=com.docker.compose.project={}", project.name),
+    ]);
+    if quiet {
+        args.push("--quiet".to_owned());
+    } else if json {
+        args.extend(["--format".to_owned(), "json".to_owned()]);
+    }
+    args
+}
+
+fn truncate_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+fn container_state(state: i32) -> &'static str {
+    match state {
+        1 => "Created",
+        2 => "Running",
+        3 => "Exited",
+        4 => "Deleted",
+        _ => "Invalid",
+    }
+}
+
+fn orphan_names(mut existing: Vec<String>, expected: &BTreeSet<&str>) -> Vec<String> {
+    existing.sort();
+    existing.dedup();
+    existing
+        .into_iter()
+        .filter(|name| !expected.contains(name.as_str()))
+        .collect()
+}
+
+fn dependency_wait_timeout() -> Result<Option<Duration>> {
+    parse_dependency_wait_timeout(std::env::var(DEPENDENCY_WAIT_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_dependency_wait_timeout(value: Option<&str>) -> Result<Option<Duration>> {
+    let seconds = match value {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            Error::InvalidConfig(format!(
+                "{DEPENDENCY_WAIT_TIMEOUT_ENV} must be a non-negative integer number of seconds"
+            ))
+        })?,
+        None => DEFAULT_DEPENDENCY_WAIT_TIMEOUT_SECS,
+    };
+    Ok((seconds != 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn command_error(args: &[String], status: ExitStatus, stderr: &[u8]) -> Error {
@@ -485,6 +739,27 @@ fn create_args(
     }
     for (_, ulimit) in &service.ulimits {
         args.extend(["--ulimit".to_owned(), ulimit.clone()]);
+    }
+    if let Some(healthcheck) = &service.healthcheck {
+        if healthcheck.disabled {
+            args.push("--no-healthcheck".to_owned());
+        } else {
+            if let Some(command) = &healthcheck.command {
+                args.extend(["--health-cmd".to_owned(), command.clone()]);
+            }
+            if let Some(interval) = &healthcheck.interval {
+                args.extend(["--health-interval".to_owned(), interval.clone()]);
+            }
+            if let Some(timeout) = &healthcheck.timeout {
+                args.extend(["--health-timeout".to_owned(), timeout.clone()]);
+            }
+            if let Some(start_period) = &healthcheck.start_period {
+                args.extend(["--health-start-period".to_owned(), start_period.clone()]);
+            }
+            if let Some(retries) = healthcheck.retries {
+                args.extend(["--health-retries".to_owned(), retries.to_string()]);
+            }
+        }
     }
     if let Some(workdir) = &service.working_dir {
         args.extend(["--workdir".to_owned(), workdir.clone()]);
@@ -639,7 +914,7 @@ mod tests {
     use indexmap::{IndexMap, IndexSet};
 
     use super::*;
-    use crate::model::{Service, ServiceNetwork};
+    use crate::model::{Healthcheck, Service, ServiceNetwork};
 
     fn project_and_service() -> (Project, Service) {
         let service = Service {
@@ -653,6 +928,7 @@ mod tests {
             ports: vec!["8080:80".to_owned()],
             mounts: Vec::new(),
             depends_on: Vec::new(),
+            dependency_conditions: IndexMap::new(),
             profiles: IndexSet::new(),
             labels: IndexMap::new(),
             networks: vec![ServiceNetwork {
@@ -670,6 +946,7 @@ mod tests {
             memory: None,
             cpus: None,
             ulimits: IndexMap::new(),
+            healthcheck: None,
             stop_signal: "SIGTERM".to_owned(),
             stop_grace_period: std::time::Duration::from_secs(10),
             restart: None,
@@ -688,7 +965,15 @@ mod tests {
 
     #[test]
     fn create_arguments_include_compose_identity_and_runtime_options() {
-        let (project, service) = project_and_service();
+        let (project, mut service) = project_and_service();
+        service.healthcheck = Some(Healthcheck {
+            command: Some("wget -q localhost/health".to_owned()),
+            interval: Some("5s".to_owned()),
+            timeout: Some("2s".to_owned()),
+            start_period: Some("10s".to_owned()),
+            retries: Some(3),
+            disabled: false,
+        });
         let args = create_args(
             &project,
             &service,
@@ -706,6 +991,12 @@ mod tests {
             .iter()
             .any(|value| value == "com.docker.compose.project=demo"));
         assert!(args.iter().any(|value| value == "MODE=test"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--health-cmd", "wget -q localhost/health"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--health-retries", "3"]));
     }
 
     #[test]
@@ -714,5 +1005,79 @@ mod tests {
             (key == "WSLC_REGISTRY_MIRROR").then(|| "https://mirror.example.com".to_owned())
         });
         assert!(result.unwrap_err().to_string().contains("not a URL"));
+    }
+
+    #[test]
+    fn project_list_arguments_apply_compose_label_and_output_flags() {
+        let (project, _) = project_and_service();
+        assert_eq!(
+            project_list_args(&project, true, false, true),
+            [
+                "list",
+                "--all",
+                "--filter",
+                "label=com.docker.compose.project=demo",
+                "--format",
+                "json",
+            ]
+        );
+        assert_eq!(
+            project_list_args(&project, false, true, false),
+            [
+                "list",
+                "--filter",
+                "label=com.docker.compose.project=demo",
+                "--quiet",
+            ]
+        );
+    }
+
+    #[test]
+    fn listed_container_preserves_wslc_json_fields() {
+        let json = r#"[{"Id":"abcdef1234567890","Name":"demo-web-1","Image":"alpine","State":2,"Ports":[]}]"#;
+        let containers: Vec<ListedContainer> = serde_json::from_str(json).unwrap();
+        assert_eq!(containers[0].name, "demo-web-1");
+        assert_eq!(truncate_id(&containers[0].id), "abcdef123456");
+        assert_eq!(container_state(containers[0].state), "Running");
+        assert!(containers[0].extra.contains_key("Ports"));
+    }
+
+    #[test]
+    fn orphan_detection_is_exact_deterministic_and_deduplicated() {
+        let expected = BTreeSet::from(["demo-web-1"]);
+        assert_eq!(
+            orphan_names(
+                vec![
+                    "demo-old-1".to_owned(),
+                    "demo-web-1".to_owned(),
+                    "demo-old-1".to_owned(),
+                ],
+                &expected,
+            ),
+            ["demo-old-1"]
+        );
+    }
+
+    #[test]
+    fn parses_wslc_dependency_runtime_state() {
+        let json = r#"[{"State":{"Status":"running","Running":true,"ExitCode":0,"Health":{"Status":"healthy"}}}]"#;
+        let containers: Vec<InspectedContainer> = serde_json::from_str(json).unwrap();
+        assert_eq!(containers[0].state.status, "running");
+        assert!(containers[0].state.running);
+        assert_eq!(containers[0].state.exit_code, 0);
+        assert_eq!(
+            containers[0].state.health.as_ref().unwrap().status,
+            "healthy"
+        );
+    }
+
+    #[test]
+    fn dependency_wait_timeout_defaults_and_can_be_disabled() {
+        assert_eq!(
+            parse_dependency_wait_timeout(None).unwrap(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(parse_dependency_wait_timeout(Some("0")).unwrap(), None);
+        assert!(parse_dependency_wait_timeout(Some("later")).is_err());
     }
 }
