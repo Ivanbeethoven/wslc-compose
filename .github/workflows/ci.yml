@@ -13,6 +13,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Checkout wslc-rs path dependency
+        shell: pwsh
+        run: >
+          git clone --depth 1 --branch master https://github.com/Ivanbeethoven/wslc-rs.git
+          "$env:GITHUB_WORKSPACE\..\wslc-rs"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
