@@ -233,6 +233,27 @@ Each selected big profile should report `Errors = 0` and `GiB = 8`. With the S3
 backend, `fio-bigwrite-rustfs-objects.json` and
 `fio-bigread-rustfs-objects.json` must contain objects.
 
+## JuiceFS fio through wslc-compose
+
+The BrewFS repository also contains an equivalent JuiceFS test using Redis,
+RustFS, a privileged FUSE container, and the same fio profile names:
+
+```powershell
+Set-Location "$Workspace\brewfs"
+$env:WSLC_COMPOSE = $WslcCompose
+$env:WSLC_COMPOSE_STATE_ROOT = "D:\wslc-compose-tests\juicefs-$RunId"
+
+.\docker\compose-xfstests\run_juicefs_perf_wslc.ps1 `
+  -ArtifactsDir "D:\juicefs-artifacts\$RunId" `
+  -Tools fio-bigwrite,fio-bigread
+```
+
+JuiceFS is installed from its official CDN inside the test container. The
+driver validates fio errors and transferred bytes and requires a nonempty
+RustFS object report. See
+`docker/compose-xfstests/juicefs-wslc-testing.md` in the BrewFS repository for
+the smoke-size overrides, full profile set, artifact contract, and cleanup.
+
 ## Cleanup and troubleshooting
 
 `down --volumes` removes project resources, but the SDK daemon remains alive
@@ -262,6 +283,9 @@ Common failures:
   verify `Get-Service wslservice` reports `Running`.
 - `SdkNotFound`: put the matching branch `wslcsdk.dll` directory first on the
   current shell `PATH`.
+- `/dev/fuse` exists but opening it returns `EPERM`: ensure the custom
+  `wslcsdk.dll` is beside `wslc-compose.exe`. Windows prefers that directory;
+  an older DLL masks out the privileged flag before the SDK call.
 - `No such image` after a mirrored pull: use the current `wslc-compose` branch;
   it resolves the image once so pulling and creating use the same reference.
 - Image pull with no progress: check `curl.exe -I https://<registry-host>/v2/`.
